@@ -1,0 +1,57 @@
+{
+  "name": "server",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "bin": "./index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "nodemon index.js",
+    "start": "node index.js",
+    "build": "node build.js",
+    "package": "pkg . --out-path build --targets node18-win-x64"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "pkg": {
+    "scripts": [
+      "config/**/*.js",
+      "**/*.js"
+    ],
+    "assets": [
+      "views/**/*",
+      "public/**/*",
+      ".env"
+    ],
+    "targets": [
+      "node18-win-x64"
+    ],
+    "outputPath": "build",
+    "nodeVersion": "18.0.0"
+  },
+  "dependencies": {
+    "@msgpack/msgpack": "^3.1.3",
+    "@upstash/redis": "^1.36.1",
+    "axios": "^0.27.2",
+    "bcryptjs": "^3.0.2",
+    "compression": "^1.8.1",
+    "connect-mongo": "^5.1.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "express": "^5.1.0",
+    "express-session": "^1.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "lodash": "^4.17.21",
+    "mongoose": "^8.16.3",
+    "simple-git": "^3.30.0",
+    "socket.io": "^4.8.1",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "nodemon": "^3.1.10",
+    "pkg": "^5.8.1"
+  }
+}
