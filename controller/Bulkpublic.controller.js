@@ -29,6 +29,7 @@ const VIEWS_NEEDING_MATCHES_LIST = new Set([
 ]);
 const VIEWS_NEEDING_ALL_MATCH_DATAS = new Set([
   'Schedule', 'highlightPoints', 'HighlightSchedule', 'OverAllData', 'OverallFrags',
+  'EventMvp',
 ]);
 
 const NUMERIC_PLAYER_FIELDS = [
