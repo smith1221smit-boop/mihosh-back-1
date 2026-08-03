@@ -15,6 +15,7 @@ const { createMatchDataForMatchDoc } = require('./matchData.controller');
 -------------------------------------------------------------------- */
 const VIEWS_NEEDING_OVERALL = new Set([
   'OverAllData', 'OverallFrags', 'LiveStats', '1stRunnerUp', '2ndRunnerUp', 'EventMvp', 'highlightPoints',
+  'Champions',
 ]);
 const VIEWS_NEEDING_MATCH_DATA = new Set([
   'Upper', 'Dom', 'Alerts', 'LiveStats', 'LiveFrags', 'MatchData', 'Achive', 'MatchFragrs',
