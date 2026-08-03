@@ -25,7 +25,7 @@ const VIEWS_NEEDING_MATCH_DATA = new Set([
 ]);
 const VIEWS_NEEDING_BACKPACK = new Set(['Upper']);
 const VIEWS_NEEDING_MATCHES_LIST = new Set([
-  'Lower', 'Schedule', 'HighlightSchedule', 'OverAllData', 'OverallFrags', 'highlightPoints',
+  'Lower', 'Schedule', 'HighlightSchedule', 'OverAllData', 'OverallFrags', 'highlightPoints' , 'EventMvp',,
 ]);
 const VIEWS_NEEDING_ALL_MATCH_DATAS = new Set([
   'Schedule', 'highlightPoints', 'HighlightSchedule', 'OverAllData', 'OverallFrags',
