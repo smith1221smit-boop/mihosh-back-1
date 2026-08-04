@@ -8,10 +8,12 @@ const Round = require('../models/round.model');
 
 const ROOM = (tournamentId, roundId) => `bulk:${tournamentId}:${roundId}`;
 
-// Debounce so a burst of writes to the same round (e.g. a matchdata doc
-// updating many players in a short window) collapses into one payload build
-// + one emit, instead of one per write.
-const pendingTimers = new Map();
+// Leading+trailing per round: a burst of writes to the same round (e.g. a
+// matchdata doc updating many players in a short window) still collapses
+// into one payload build + one emit via the trailing fire, but the FIRST
+// write in an otherwise-isolated window (the common case) emits immediately
+// instead of always waiting the full DEBOUNCE_MS with nothing to coalesce.
+const pendingTimers = new Map(); // key -> { timer, pendingTrailing }
 const DEBOUNCE_MS = 250;
 
 // getMatchDataByMatchId/getBulkData/overall are cached (middleware/cache.js)
@@ -30,15 +32,22 @@ function scheduleEmit(io, tournamentId, roundId, matchId, followSelected) {
   if (!tournamentId || !roundId) return;
   const key = `${tournamentId}:${roundId}`;
 
-  if (pendingTimers.has(key)) return; // already scheduled, let it fire
-  const timer = setTimeout(async () => {
-    pendingTimers.delete(key);
+  const state = pendingTimers.get(key);
+  if (state) {
+    // Already in a cooldown window from an earlier write — remember to
+    // fire once more when it closes, coalescing this burst into one
+    // trailing emit exactly like before.
+    state.pendingTrailing = { matchId, followSelected };
+    return;
+  }
+
+  const emitNow = async (mId, fSel) => {
     try {
       const payload = await buildBulkPayload({
         tournamentId,
         roundId,
-        matchId,
-        followSelected,
+        matchId: mId,
+        followSelected: fSel,
         // liveUpdate (not includeAll): sends the lightweight schedule/overall
         // data every mounted view needs, plus the one match that actually
         // changed — but skips re-embedding every match's full roster on
@@ -49,9 +58,20 @@ function scheduleEmit(io, tournamentId, roundId, matchId, followSelected) {
     } catch (err) {
       console.error('bulkSocket: failed to build/emit payload', err);
     }
+  };
+
+  // Leading edge: fire immediately for the first write in this window.
+  emitNow(matchId, followSelected);
+
+  const timer = setTimeout(() => {
+    const s = pendingTimers.get(key);
+    pendingTimers.delete(key);
+    if (s && s.pendingTrailing) {
+      emitNow(s.pendingTrailing.matchId, s.pendingTrailing.followSelected);
+    }
   }, DEBOUNCE_MS);
 
-  pendingTimers.set(key, timer);
+  pendingTimers.set(key, { timer, pendingTrailing: null });
 }
 
 /**
@@ -137,4 +157,4 @@ function registerBulkSocket(io) {
   console.log('✅ Bulk socket rooms + change streams registered');
 }
 
-module.exports = { registerBulkSocket, ROOM };
+module.exports = { registerBulkSocket, ROOM, scheduleEmit, bustCache };

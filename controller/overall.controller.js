@@ -3,7 +3,6 @@ const Match = require('../models/match.model');
 const MatchData = require('../models/matchData.model');
 const Round = require('../models/round.model');
 const Tournament = require('../models/tournament.model');
-const { createMatchDataForMatchDoc } = require('./matchData.controller');
 const { getSocket } = require('../socket');
 
 // Numeric player fields to aggregate (sum)
@@ -122,46 +121,22 @@ function dedupPlayersWithinMatch(players) {
   return Array.from(map.values());
 }
 
-const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, userId) => {
-  // Verify round exists (skip ownership for public routes)
-  const round = await Round.findOne({ _id: roundId, tournamentId, ...(userId && { createdBy: userId }) });
-  if (!round) throw new Error('Round not found');
-
-  // Verify match exists (skip ownership for public routes)
-  const targetMatch = await Match.findOne({ _id: matchId, tournamentId, roundId, ...(userId && { userId }) });
-  if (!targetMatch) throw new Error('Match not found');
-
-  // Fetch all matches for this tournament/round, sorted by matchNo
-  const matches = await Match.find({ tournamentId, roundId, ...(userId && { userId }) }, { _id: 1, matchNo: 1 }).sort({ matchNo: 1 }).lean();
-  if (!matches || matches.length === 0) {
-    return [];
-  }
-
-  // Filter matches up to and including the target match's matchNo
-  const filteredMatches = matches.filter(m => m.matchNo <= targetMatch.matchNo);
-  const matchIds = filteredMatches.map(m => m._id);
-
-  // Ensure matchData exists for each match (create if missing to follow current pattern)
-  const existing = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).select('_id matchId').lean();
-  const existingMap = new Map(existing.map(md => [md.matchId.toString(), md._id]));
-
-  for (const m of matchIds) {
-    if (!existingMap.has(m.toString())) {
-      try {
-        await createMatchDataForMatchDoc(m);
-      } catch (e) {
-        console.warn('Could not create MatchData for match', m.toString(), e?.message || e);
-      }
-    }
-  }
-
-  // Load all matchData after attempting creation
-  const matchDatas = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).lean();
-
-  // FIX: Deduplicate MatchData documents by matchId (there should only be one
+// Shared aggregation core — turns an array of already-resolved MatchData docs
+// into standings. Used by both computeOverallMatchDataForRound (below) and
+// Bulkpublic.controller.js's getOverallForRound, so the dashboard/live-socket
+// path and the public bulk/overlay path always compute the exact same
+// numbers instead of drifting apart via two hand-maintained implementations.
+//
+// Player aggregation is scoped PER TEAM (a Map on each aggTeam), not one map
+// shared across every team in the round — a global map would silently merge
+// one player's stats onto every team that happens to share their uId (see
+// the cross-team playerId collision fixed in pubgApiMatchData.controller.js's
+// uidToTeam building).
+function aggregateOverallTeams(matchDataDocs) {
+  // Deduplicate MatchData documents by matchId (there should only be one
   // per match, but if duplicates ever exist, keep the most recently updated one)
   const uniqueMatchDatasMap = new Map();
-  for (const md of matchDatas) {
+  for (const md of matchDataDocs || []) {
     const key = md.matchId.toString();
     const existingDoc = uniqueMatchDatasMap.get(key);
     if (
@@ -182,13 +157,20 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
     })),
   }));
 
-  // Aggregate by teamId
-  const teamsMap = new Map();   // key: teamId string -> aggregated team
-  const playersMap = new Map(); // key: uId string -> aggregated player
+  const teamsMap = new Map(); // key: teamId string -> aggregated team (players Map scoped per team)
 
   for (const md of deduplicatedMatchDatas) {
+    const seenTeamIds = new Set();
     for (const team of md.teams || []) {
       const teamKey = team.teamId.toString();
+      // Defensive: two teams[] subdocuments sharing a teamId within the
+      // SAME MatchData would otherwise double-count placePoints/wwcd.
+      if (seenTeamIds.has(teamKey)) {
+        console.warn(`[aggregateOverallTeams] duplicate teamId ${teamKey} in matchData ${md._id} — skipping to avoid double-counting`);
+        continue;
+      }
+      seenTeamIds.add(teamKey);
+
       if (!teamsMap.has(teamKey)) {
         teamsMap.set(teamKey, {
           teamId: team.teamId,
@@ -198,8 +180,8 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
           slot: Number.isFinite(team.slot) ? team.slot : 0,
           placePoints: 0,
           wwcd: 0,
-          matchIds: new Set(),  // NEW: track distinct matches this team appeared in
-          players: new Set(),   // set of uId strings
+          matchIds: new Set(),  // track distinct matches this team appeared in
+          players: new Map(),   // uId -> aggregated player, scoped to THIS team
         });
       }
 
@@ -213,20 +195,22 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
       }
 
       aggTeam.placePoints += Number(team.placePoints || 0);
-      if (Number(team.placePoints || 0) === 10) {
+      // Prefer the real computed rank; only fall back to the placePoints
+      // heuristic for older docs written before `rank` was persisted.
+      const isWinner = team.rank === 1 || (!team.rank && Number(team.placePoints || 0) === 10);
+      if (isWinner) {
         aggTeam.wwcd += 1;
       }
 
-      // NEW: record that this team played in this match
       aggTeam.matchIds.add(md.matchId.toString());
 
-      // Aggregate players globally by uId (sum each match's final stats across matches)
+      // Aggregate players per-team by uId (sum each match's final stats across matches)
       for (const p of team.players || []) {
-        const pKey = p.uId || '';
-        if (!playersMap.has(pKey)) {
-          playersMap.set(pKey, buildInitialAggPlayer(p));
+        const pKey = p.uId || p._id.toString();
+        if (!aggTeam.players.has(pKey)) {
+          aggTeam.players.set(pKey, buildInitialAggPlayer(p));
         }
-        const aggPlayer = playersMap.get(pKey);
+        const aggPlayer = aggTeam.players.get(pKey);
 
         if (p.playerName) aggPlayer.playerName = p.playerName;
         if (p.picUrl) aggPlayer.picUrl = p.picUrl;
@@ -237,8 +221,6 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
         if (p.teamIdfromApi) aggPlayer.teamIdfromApi = p.teamIdfromApi;
 
         sumNumericFields(aggPlayer, p, NUMERIC_PLAYER_FIELDS);
-
-        aggTeam.players.add(pKey);
       }
     }
   }
@@ -252,8 +234,8 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
     slot: t.slot || 0,
     placePoints: t.placePoints,
     wwcd: t.wwcd,
-    matchesPlayed: t.matchIds.size, // NEW FIELD
-    players: Array.from(t.players).map(uId => playersMap.get(uId)).filter(Boolean),
+    matchesPlayed: t.matchIds.size,
+    players: Array.from(t.players.values()),
   })).sort((a, b) => (a.slot || 0) - (b.slot || 0));
 
   // Final safety net: no duplicate uId within a team's players
@@ -262,6 +244,55 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
   }
 
   return aggregatedTeams;
+}
+
+const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, userId) => {
+  // Verify round exists (skip ownership for public routes)
+  const round = await Round.findOne({ _id: roundId, tournamentId, ...(userId && { createdBy: userId }) });
+  if (!round) throw new Error('Round not found');
+
+  // Verify match exists (skip ownership for public routes) — matchId is only
+  // used for this existence/ownership check now, not to filter which matches
+  // count toward standings: standings are always the FULL round total (see
+  // aggregateOverallTeams), matching Bulkpublic.controller.js's behavior.
+  const targetMatch = await Match.findOne({ _id: matchId, tournamentId, roundId, ...(userId && { userId }) });
+  if (!targetMatch) throw new Error('Match not found');
+
+  // Fetch all matches for this tournament/round
+  const matches = await Match.find({ tournamentId, roundId, ...(userId && { userId }) }, { _id: 1, matchNo: 1 }).sort({ matchNo: 1 }).lean();
+  if (!matches || matches.length === 0) {
+    return [];
+  }
+
+  const matchIds = matches.map(m => m._id);
+
+  // Ensure matchData exists for each match (create if missing to follow current pattern)
+  const existing = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).select('_id matchId').lean();
+  const existingMap = new Map(existing.map(md => [md.matchId.toString(), md._id]));
+
+  // Required lazily (not at module top level): matchData.controller.js also
+  // requires this file (for computeOverallMatchDataForRound), and a
+  // top-level circular require here previously left createMatchDataForMatchDoc
+  // resolved to undefined depending on which module loaded first — silently
+  // skipping MatchData creation (and that match's points) for any match that
+  // never got a MatchData doc. Requiring it here, after both modules have
+  // finished loading, always gets the real function.
+  const { createMatchDataForMatchDoc } = require('./matchData.controller');
+
+  for (const m of matchIds) {
+    if (!existingMap.has(m.toString())) {
+      try {
+        await createMatchDataForMatchDoc(m);
+      } catch (e) {
+        console.warn('Could not create MatchData for match', m.toString(), e?.message || e);
+      }
+    }
+  }
+
+  // Load all matchData after attempting creation
+  const matchDatas = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).lean();
+
+  return aggregateOverallTeams(matchDatas);
 };
 
 // GET overall aggregated matchData for a round in a tournament
@@ -301,4 +332,5 @@ const getOverallMatchDataForRound = async (req, res) => {
 module.exports = {
   getOverallMatchDataForRound,
   computeOverallMatchDataForRound,
+  aggregateOverallTeams,
 };

@@ -11,4 +11,8 @@ const matchSchema = new mongoose.Schema({
    userId: { type: Schema.Types.ObjectId, ref: 'User', required: true }, // ✅ new
 });
 
+// Every live-tick payload build (Bulkpublic.controller.js, overall.controller.js)
+// filters Match.find({tournamentId, roundId}) — was running unindexed.
+matchSchema.index({ tournamentId: 1, roundId: 1 });
+
 module.exports = mongoose.models.Match || mongoose.model('Match', matchSchema);

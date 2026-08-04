@@ -28,6 +28,22 @@ async function updateTeamsWithApiPlayers(apiPlayers, matchId, userId) {
     const teams = await Team.find({ _id: { $in: teamIds } });
     const teamMap = Object.fromEntries(teams.map(t => [t._id.toString(), t]));
 
+    // Every uId already known to ANY team in this match, so a slot-based
+    // guess (apiPlayer.teamId is PUBG's ephemeral in-match id, not
+    // guaranteed to match our tournament slot numbering) that happens to
+    // land on a uId already registered to a DIFFERENT team is treated as a
+    // wrong guess rather than blindly re-adding it — this roster is shared
+    // across tournaments, so a bad guess here corrupts it permanently, not
+    // just this one match.
+    const knownUidToTeamId = new Map();
+    for (const team of teams) {
+      for (const p of team.players || []) {
+        if (p.playerId) knownUidToTeamId.set(String(p.playerId), team._id.toString());
+      }
+    }
+
+    const MAX_PLAYERS = 4;
+
     for (const apiPlayer of apiPlayers) {
       const teamDbId = slotToTeamId[apiPlayer.teamId]; // map API slot → DB _id
       if (!teamDbId) continue;
@@ -44,6 +60,16 @@ async function updateTeamsWithApiPlayers(apiPlayers, matchId, userId) {
         continue;
       }
 
+      const owningTeamId = knownUidToTeamId.get(String(uId));
+      if (owningTeamId && owningTeamId !== String(team._id)) {
+        // Already a known member of a different team — the slot guess is
+        // almost certainly wrong for this player this match, don't
+        // misattribute them.
+        continue;
+      }
+
+      if (team.players.length >= MAX_PLAYERS) continue;
+
       // Add new player
       team.players.push({
         _id: new mongoose.Types.ObjectId(),
@@ -54,6 +80,7 @@ async function updateTeamsWithApiPlayers(apiPlayers, matchId, userId) {
 
       team.markModified('players');
       await team.save();
+      knownUidToTeamId.set(String(uId), String(team._id));
       newPlayersAdded++;
     }
 

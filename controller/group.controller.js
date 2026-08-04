@@ -1,6 +1,7 @@
 const Group = require('../models/group.model.js');
 const Team = require('../models/teams.model.js');
 const Tournament = require('../models/tournament.model.js');
+const { syncMatchDataTeamsForGroup } = require('./matchData.controller.js');
 
 // CREATE Group (user-scoped)
 const createGroup = async (req, res) => {
@@ -134,6 +135,11 @@ const updateGroup = async (req, res) => {
     }
 
     const updatedGroup = await group.save();
+
+    if (Array.isArray(slots)) {
+      await syncMatchDataTeamsForGroup(updatedGroup._id);
+    }
+
     res.json(updatedGroup);
   } catch (err) {
     console.error(err);

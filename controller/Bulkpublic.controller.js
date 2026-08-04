@@ -7,6 +7,7 @@ const MatchData = require('../models/matchData.model');
 const MatchSelection = require('../models/MatchSelection.model');
 const Group = require('../models/group.model.js');
 const { createMatchDataForMatchDoc } = require('./matchData.controller');
+const { aggregateOverallTeams } = require('./overall.controller');
 
 /* --------------------------------------------------------------------
    Same view -> data-requirement tables as the frontend
@@ -182,25 +183,6 @@ function applyLiveTeamDiff(matchId, matchData) {
   matchData.teams = changedTeams;
   matchData.isPartialTeams = true;
   return matchData;
-}
-
-function sumNumericFields(target, source, fields) {
-  for (const f of fields) {
-    target[f] = Number(target[f] || 0) + Number(source[f] || 0);
-  }
-}
-
-// Only aggregates the identity + stat fields overallData's consumers
-// actually read (confirmed across all 6 themes' OverAllData/OverallFrags/
-// LiveStats/EventMvp/1st-2ndRunnerUp/HighlightPoints) — NOT the full
-// NUMERIC_PLAYER_FIELDS list, which stays reserved for the real-time
-// matchData live-diff path (fingerprintTeam/applyLiveTeamDiff).
-function buildInitialAggPlayer(p) {
-  const base = {
-    uId: p.uId || '', _id: p._id, playerName: p.playerName || '', picUrl: p.picUrl || '',
-  };
-  for (const f of SUMMARY_PLAYER_FIELDS) base[f] = 0;
-  return base;
 }
 
 /* --------------------------------------------------------------------
@@ -383,20 +365,64 @@ async function getMatchDataForMatch(matchId) {
   return getMatchDataForMatchDoc(match);
 }
 
-/** Fetch matchData for a list of matches in parallel, keyed by matchId string. */
+/**
+ * Fetch matchData for a list of matches, keyed by matchId string. One
+ * batched $in query instead of a per-match findOne — the previous version
+ * ran N (or up to 2N on the userId-fallback branch) separate round trips
+ * per call, and this runs on every live tick via comsock.js, so it scaled
+ * with round size on every single update.
+ */
 async function getMatchDataBatch(matches) {
-  const results = await Promise.all(
-    matches.map(m => getMatchDataForMatchDoc(m).catch(() => null))
-  );
   const map = new Map();
-  matches.forEach((m, i) => {
-    if (results[i]) map.set(m._id.toString(), results[i]);
-  });
+  if (!matches.length) return map;
+
+  const matchIds = matches.map(m => m._id);
+  const allMatchDatas = await MatchData.find({ matchId: { $in: matchIds } }).lean();
+
+  const byMatchId = new Map(); // matchId string -> MatchData[]
+  for (const md of allMatchDatas) {
+    const key = md.matchId.toString();
+    if (!byMatchId.has(key)) byMatchId.set(key, []);
+    byMatchId.get(key).push(md);
+  }
+
+  await Promise.all(matches.map(async (m) => {
+    const key = m._id.toString();
+    const candidates = byMatchId.get(key) || [];
+    // Prefer the doc whose userId matches the match's own userId, same
+    // preference the old findOne({matchId,userId}) -> findOne({matchId})
+    // fallback expressed.
+    let matchData = candidates.find(md => String(md.userId) === String(m.userId)) || candidates[0] || null;
+
+    if (!matchData) {
+      // Rare path: no MatchData exists yet for this match — lazily create
+      // it, one at a time, only for the matches that actually need it.
+      try {
+        const created = await createMatchDataForMatchDoc(m._id);
+        matchData = created && created.toObject ? created.toObject() : created;
+      } catch (err) {
+        return;
+      }
+    }
+    if (!matchData) return;
+
+    matchData = hydrateMatchDataIdentity(matchData, m.tournamentId);
+    matchData.deadTeamList = updateDeadTeamList(m._id, matchData);
+    map.set(key, matchData);
+  }));
+
   return map;
 }
 
 /**
  * Aggregate every match in a round into cumulative per-team / per-player totals.
+ * Thin wrapper around overall.controller.js's aggregateOverallTeams — the same
+ * core the dashboard/live-socket path (computeOverallMatchDataForRound) uses,
+ * so this public/bulk path and that one always agree on placePoints/wwcd/stats
+ * instead of drifting apart via two hand-maintained implementations. This
+ * function keeps its own matches/matchDataMap fetching (with the optional
+ * pre-fetched params for the buildBulkPayload batching path) since that part
+ * isn't the source of any mismatch and is already optimized for this call site.
  */
 async function getOverallForRound(tournamentId, roundId, { matches: matchesIn, matchDataMap: matchDataMapIn } = {}) {
   const matches = matchesIn || await Match.find({ tournamentId, roundId }).sort({ matchNo: 1 }).lean();
@@ -405,52 +431,7 @@ async function getOverallForRound(tournamentId, roundId, { matches: matchesIn, m
   }
 
   const matchDataMap = matchDataMapIn || await getMatchDataBatch(matches);
-
-  const teamsMap = new Map();
-
-  for (const m of matches) {
-    const matchData = matchDataMap.get(m._id.toString());
-    if (!matchData) continue;
-
-    for (const team of matchData.teams || []) {
-      const teamKey = team.teamId.toString();
-      if (!teamsMap.has(teamKey)) {
-        teamsMap.set(teamKey, {
-          teamId: team.teamId, teamName: team.teamName || '', teamTag: team.teamTag || '',
-          teamLogo: team.teamLogo || '', slot: Number.isFinite(team.slot) ? team.slot : 0,
-          placePoints: 0, wwcd: 0, matchIds: new Set(), players: new Map(),
-        });
-      }
-      const aggTeam = teamsMap.get(teamKey);
-      if (!aggTeam.teamName && team.teamName) aggTeam.teamName = team.teamName;
-      if (!aggTeam.teamTag && team.teamTag) aggTeam.teamTag = team.teamTag;
-      if (!aggTeam.teamLogo && team.teamLogo) aggTeam.teamLogo = team.teamLogo;
-      if (Number.isFinite(team.slot)) aggTeam.slot = Math.min(aggTeam.slot || team.slot, team.slot);
-      aggTeam.placePoints += Number(team.placePoints || 0);
-      if (Number(team.placePoints || 0) === 10) aggTeam.wwcd += 1;
-
-      aggTeam.matchIds.add(m._id.toString());
-
-      for (const p of team.players || []) {
-        const pKey = p.uId || p._id.toString();
-        if (!aggTeam.players.has(pKey)) aggTeam.players.set(pKey, buildInitialAggPlayer(p));
-        const aggPlayer = aggTeam.players.get(pKey);
-        if (p.playerName) aggPlayer.playerName = p.playerName;
-        if (p.picUrl) aggPlayer.picUrl = p.picUrl;
-        if (p.uId) aggPlayer.uId = p.uId;
-        sumNumericFields(aggPlayer, p, SUMMARY_PLAYER_FIELDS);
-      }
-    }
-  }
-
-  const teams = Array.from(teamsMap.values())
-    .map(t => ({
-      teamId: t.teamId, teamName: t.teamName, teamTag: t.teamTag, teamLogo: t.teamLogo,
-      slot: t.slot || 0, placePoints: t.placePoints, wwcd: t.wwcd,
-      matchesPlayed: t.matchIds.size,
-      players: Array.from(t.players.values()),
-    }))
-    .sort((a, b) => (a.slot || 0) - (b.slot || 0));
+  const teams = aggregateOverallTeams(Array.from(matchDataMap.values()));
 
   return {
     tournamentId,
@@ -659,4 +640,7 @@ module.exports = {
   getMatchDataForMatchDoc,
   getMatchDataBatch,
   getOverallForRound,
+  hydrateMatchDataIdentity,
+  updateDeadTeamList,
+  applyLiveTeamDiff,
 };

@@ -29,9 +29,7 @@ const matchRoutes = require('./route/match.route.js');
 const matchDataRoutes = require('./route/matchData.route.js');
 const matchSelectionRoutes = require('./route/matchSelection.route.js');
 const overallRoutes = require('./route/overall.route.js');
-const lowerRoute = require('./graphicsRoute/lower.route.js');
-const liveDataRoute = require('./graphicsRoute/liveData.route.js');
-const overallRoute = require('./graphicsRoute/overallData.route.js');
+
 const userRoutes = require('./route/User.route.js');
 const bulkRoutes = require('./route/Bulkpublic.route.js');
 
@@ -263,9 +261,6 @@ app.use('/api', teamRoutes);
 app.use('/api', matchDataRoutes);
 app.use('/api/matchSelection', matchSelectionRoutes);
 app.use('/api', overallRoutes);
-app.use('/api/lowerData', lowerRoute);
-app.use('/api/liveData', liveDataRoute);
-app.use('/api/overallData', overallRoute);
 app.use('/api/public', bulkRoutes);
 
 // --- PUBLIC ROUTES (No Authentication Required) ---
@@ -554,8 +549,17 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
       }
       if (!matchData) continue;
 
+      const seenTeamIds = new Set();
       for (const team of matchData.teams || []) {
         const teamKey = team.teamId.toString();
+        // Defensive: two teams[] subdocuments sharing a teamId within the
+        // SAME MatchData would otherwise double-count placePoints/wwcd.
+        if (seenTeamIds.has(teamKey)) {
+          console.warn(`[overall route] duplicate teamId ${teamKey} in matchData ${matchData._id} — skipping to avoid double-counting`);
+          continue;
+        }
+        seenTeamIds.add(teamKey);
+
         if (!teamsMap.has(teamKey)) {
           teamsMap.set(teamKey, {
             teamId: team.teamId,
@@ -576,7 +580,10 @@ app.get('/api/public/tournaments/:tournamentId/rounds/:roundId/overall', cacheMi
           aggTeam.slot = Math.min(aggTeam.slot || team.slot, team.slot);
         }
         aggTeam.placePoints += Number(team.placePoints || 0);
-        if (Number(team.placePoints || 0) === 10) aggTeam.wwcd += 1;
+        // Prefer the real computed rank; only fall back to the placePoints
+        // heuristic for older docs written before `rank` was persisted.
+        const isWinner = team.rank === 1 || (!team.rank && Number(team.placePoints || 0) === 10);
+        if (isWinner) aggTeam.wwcd += 1;
 
         for (const p of team.players || []) {
           const pKey = p._id.toString();

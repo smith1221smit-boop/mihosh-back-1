@@ -70,6 +70,14 @@ const teamMatchDataSchema = new Schema({
     teamLogo: { type: String, default: '' }, // <-- add this line
   slot: { type: Number, required: true }, // ✅ slot from Group
   placePoints: { type: Number, default: 0 },
+  // Real computed placement (1 = winner), persisted alongside placePoints
+  // so WWCD/standings can key off the actual rank instead of inferring a
+  // win from a magic placePoints value that manual overrides can break.
+  rank: { type: Number, default: 0 },
+  // Set when an operator manually corrects placePoints via updateTeamPoints.
+  // While true, the live-poll scoring loop leaves placePoints/rank alone
+  // instead of silently overwriting the correction on the next tick.
+  placePointsLocked: { type: Boolean, default: false },
   players: {
     type: [playerStatsSchema],
     validate: {

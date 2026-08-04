@@ -38,6 +38,11 @@ function initializeSocket(server) {
       allowedHeaders: ["Content-Type", "Authorization", "x-cookie"],
     },
     allowEIO3: true, // Allow Engine.IO v3 clients
+    // The live payloads on this socket are already MessagePack binary —
+    // compact, high-entropy bytes that gain little from gzip/deflate but
+    // still pay its CPU cost on every emit. Default perMessageDeflate was
+    // fighting the point of using a binary wire format; disable it.
+    perMessageDeflate: false,
   });
   console.log('✅ Socket.IO initialized with CORS');
 

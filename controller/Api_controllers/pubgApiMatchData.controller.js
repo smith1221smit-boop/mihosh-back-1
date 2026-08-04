@@ -9,6 +9,9 @@ const User = require('../../models/User.model');
 const updateTeamsWithApiPlayers = require('./playerCheckandSwitch');
 const { getSocket } = require('../../socket');
 const { computeOverallMatchDataForRound } = require('../overall.controller');
+const { scheduleEmit, bustCache, ROOM } = require('../../socket/comsock');
+const { encodeMsgpack } = require('../../utils/msgpackCodec');
+const { hydrateMatchDataIdentity, updateDeadTeamList, applyLiveTeamDiff } = require('../Bulkpublic.controller');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -35,8 +38,14 @@ async function processSaveQueue() {
       { ordered: false }
     );
     console.log(c('green', `💾 Bulk-saved ${batch.length} job(s)`));
+    // Lets callers that need the write CONFIRMED durable (e.g. triggering a
+    // bulkUpdate rebuild, which re-reads from MongoDB) know it's safe to
+    // proceed now, without making the write itself any less fire-and-forget
+    // for callers that don't care (liveMatchUpdate keeps using in-memory data).
+    for (const job of batch) job.resolve?.();
   } catch (err) {
     console.error('Background save error:', err.message);
+    for (const job of batch) job.reject?.(err);
   } finally {
     isSaving = false;
     // more jobs may have queued up while we were writing
@@ -276,7 +285,14 @@ const lastOverallFingerprintByUserMatch = {};
 // ─── Event Debounce / Concurrency Guards ──────────────────────────────────────
 const EVENT_DEBOUNCE_MS = 150;   // coalesce bursts of rapid game-tick pushes per user
 
-const debounceTimersByUser = new Map(); // userId -> Timeout
+// Leading+trailing, not pure trailing-edge: PCOB ticks arrive ~2s apart in
+// the common case (isolated, not bursty), so a plain trailing-edge debounce
+// (fire only after EVENT_DEBOUNCE_MS of silence) made almost every tick pay
+// the full delay for no coalescing benefit. Firing immediately on the first
+// tick after being idle (leading edge) removes that delay for the common
+// case, while a single trailing fire still coalesces genuine bursts exactly
+// as before.
+const debounceStateByUser = new Map(); // userId -> { timer, pendingTrailing }
 const userProcessing = new Set();       // prevents overlapping runs per user
 
 // ─── Active User Tracking ───────────────────────────────────────────────────
@@ -426,18 +442,28 @@ function startLiveMatchUpdater() {
         `(${c('bold', String(incoming.length))}${isDelta ? ' changed' : ''} of ${players.length} players) user=${userId} socket=${socket.id}`
       );
 
-      // Debounce per user: bursts from ONE user's relay no longer delay or
-      // trigger extra work for every other active user.
-      if (debounceTimersByUser.has(userId)) {
-        clearTimeout(debounceTimersByUser.get(userId));
-      }
-      const timer = setTimeout(() => {
-        debounceTimersByUser.delete(userId);
+      // Leading+trailing per user: bursts from ONE user's relay still
+      // coalesce (trailing fire), but an isolated tick (the common case at
+      // PCOB's ~2s cadence) fires immediately instead of always paying the
+      // full EVENT_DEBOUNCE_MS delay for no coalescing benefit.
+      const debounceState = debounceStateByUser.get(userId);
+      if (!debounceState) {
         triggerImmediateUpdateForUser(userId).catch(err =>
           console.error(`[trigger] user ${userId} error:`, err)
         );
-      }, EVENT_DEBOUNCE_MS);
-      debounceTimersByUser.set(userId, timer);
+        const timer = setTimeout(() => {
+          const s = debounceStateByUser.get(userId);
+          debounceStateByUser.delete(userId);
+          if (s && s.pendingTrailing) {
+            triggerImmediateUpdateForUser(userId).catch(err =>
+              console.error(`[trigger] user ${userId} error:`, err)
+            );
+          }
+        }, EVENT_DEBOUNCE_MS);
+        debounceStateByUser.set(userId, { timer, pendingTrailing: false });
+      } else {
+        debounceState.pendingTrailing = true;
+      }
     });
 
     socket.on('disconnect', () => {
@@ -453,9 +479,10 @@ function startLiveMatchUpdater() {
 
       if (!stillConnected) {
         liveApiPlayersByUser.delete(userId);
-        if (debounceTimersByUser.has(userId)) {
-          clearTimeout(debounceTimersByUser.get(userId));
-          debounceTimersByUser.delete(userId);
+        const debounceState = debounceStateByUser.get(userId);
+        if (debounceState) {
+          clearTimeout(debounceState.timer);
+          debounceStateByUser.delete(userId);
         }
         console.log(c('dim', `[socket] cleared relay state for user ${userId}`));
       }
@@ -522,13 +549,85 @@ function startLiveMatchUpdater() {
 
     const normalizeId = id => (id ? String(id).trim() : '');
 
+    // Build a uId -> CANDIDATE teams index so live players are matched to
+    // their team by roster identity first. A uId normally has exactly one
+    // candidate (the common case — unchanged behavior). It can legitimately
+    // have more than one when a player is registered on two teams' rosters
+    // at once (e.g. a transfer where the old team's roster entry was never
+    // removed) — see resolveTeamForUid below for how that ambiguity gets
+    // broken using actual match signals instead of guessing from array
+    // order. PUBG's live apiPlayer.teamId is an ephemeral in-game team id
+    // assigned by the game server for that match — it is NOT guaranteed to
+    // equal our tournament-assigned team.slot, so using slot equality as
+    // the GENERAL primary join key can bucket a team's players onto the
+    // wrong team; it's only trusted below as a tiebreaker among a short,
+    // already-known candidate list, and as the fallback for players with
+    // zero candidates.
+    const uidToCandidateTeams = new Map(); // uid -> Team[] (de-duped, insertion order)
+    function addCandidate(uid, team) {
+      if (!uid) return;
+      const list = uidToCandidateTeams.get(uid) || [];
+      if (!list.includes(team)) list.push(team);
+      uidToCandidateTeams.set(uid, list);
+    }
+
+    const teamGroupPlayers = new Map(); // teamId (string) -> groupPlayers[]
+    for (const t of matchData.teams) {
+      const gSlot = group.slots.find(s => s.team?._id.toString() === t.teamId.toString());
+      const gPlayers = gSlot?.team?.players || [];
+      teamGroupPlayers.set(String(t.teamId), gPlayers);
+
+      for (const p of t.players || []) addCandidate(normalizeId(p.uId), t);
+      for (const gp of gPlayers) addCandidate(normalizeId(gp.playerId), t);
+    }
+
+    // Resolves which team a uId belongs to for THIS tick, given its
+    // candidate teams. Unambiguous case (1 candidate) is untouched — same
+    // outcome as the old single-answer uidToTeam map. For a genuinely
+    // ambiguous uId (>1 candidate), priority order:
+    //  1. Continuity — if this MATCH already established the uid under one
+    //     of the candidates on an earlier tick, stay on it (no flip-flopping).
+    //  2. The live API's own teamId for this tick, matched against a
+    //     candidate's tournament slot — freshest ground truth for "which
+    //     team is the game itself grouping them under right now."
+    //  3. Deterministic (lowest slot) + logged fallback, only if neither
+    //     signal resolves cleanly, so it never flickers and is visible in
+    //     logs for a manual check.
+    function resolveTeamForUid(uid, apiTeamIdRaw, candidates) {
+      if (!candidates || candidates.length === 0) return null;
+      if (candidates.length === 1) return candidates[0];
+
+      const established = candidates.find(t => (t.players || []).some(p => normalizeId(p.uId) === uid));
+      if (established) return established;
+
+      const apiTeamId = Number(apiTeamIdRaw);
+      const slotMatches = candidates.filter(t => Number(t.slot) === apiTeamId);
+      if (slotMatches.length === 1) return slotMatches[0];
+
+      const fallback = [...candidates].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0))[0];
+      console.warn(`[pubgApiMatchData] uId ${uid} ambiguous across teams [${candidates.map(t => t.teamId).join(', ')}] in match ${matchId} — no established/live-teamId signal resolved it, defaulting to team ${fallback.teamId}`);
+      return fallback;
+    }
+
+    const resolvedTeamByUid = new Map();
+    for (const apiPlayer of apiPlayers) {
+      const uid = normalizeId(apiPlayer.uId);
+      if (!uid || resolvedTeamByUid.has(uid)) continue;
+      const team = resolveTeamForUid(uid, apiPlayer.teamId, uidToCandidateTeams.get(uid));
+      if (team) resolvedTeamByUid.set(uid, team);
+    }
+
     for (const team of matchData.teams) {
       const newTeamPlayers = [];
       const usedUIds = new Set();
 
-      const groupSlot      = group.slots.find(s => s.team?._id.toString() === team.teamId.toString());
-      const groupPlayers   = groupSlot?.team?.players || [];
-      const teamApiPlayers = apiPlayers.filter(p => Number(p.teamId) === Number(team.slot));
+      const groupPlayers = teamGroupPlayers.get(String(team.teamId)) || [];
+      const knownTeamApiPlayers = apiPlayers.filter(p => resolvedTeamByUid.get(normalizeId(p.uId)) === team);
+      const fallbackApiPlayers = apiPlayers.filter(p => {
+        const uid = normalizeId(p.uId);
+        return !resolvedTeamByUid.has(uid) && Number(p.teamId) === Number(team.slot);
+      });
+      const teamApiPlayers = [...knownTeamApiPlayers, ...fallbackApiPlayers];
       const matchDataByUid = new Map((team.players || []).map(p => [normalizeId(p.uId), p]));
 
       for (const apiPlayer of teamApiPlayers) {
@@ -537,7 +636,24 @@ function startLiveMatchUpdater() {
         if (usedUIds.has(uid)) continue;
 
         const matchPlayer = matchDataByUid.get(uid);
-        const grpPlayer   = groupPlayers.find(p => normalizeId(p.playerId) === uid);
+        let grpPlayer = groupPlayers.find(p => normalizeId(p.playerId) === uid);
+
+        // Fallback for a roster player whose playerId is missing/mistyped:
+        // try matching by playerName (trimmed, case-insensitive) within
+        // THIS team's own roster only — groupPlayers is already scoped to
+        // `team`, so no cross-team risk. Rescues already-existing rosters
+        // with bad playerId data (new writes are now validated at the
+        // source — see teams.controller.js's validatePlayerIds) without
+        // needing a manual re-entry, and is what lets the roster photo
+        // (grpPlayer.photo, below) still get attached.
+        if (!matchPlayer && !grpPlayer && apiPlayer.playerName) {
+          const apiNameNorm = String(apiPlayer.playerName).trim().toLowerCase();
+          if (apiNameNorm) {
+            grpPlayer = groupPlayers.find(
+              p => p.playerName && String(p.playerName).trim().toLowerCase() === apiNameNorm
+            );
+          }
+        }
 
         let finalPlayer;
         if (matchPlayer || grpPlayer) {
@@ -610,19 +726,25 @@ function startLiveMatchUpdater() {
         ? Math.min(...newTeamPlayers.map(p => p.rank || 0))
         : 0;
 
-      team.placePoints = ((rank) => {
-        switch (rank) {
-          case 1: return 10;
-          case 2: return 6;
-          case 3: return 5;
-          case 4: return 4;
-          case 5: return 3;
-          case 6: return 2;
-          case 7: return 1;
-          case 8: return 1;
-          default: return 0;
-        }
-      })(teamRank);
+      // A manual correction via updateTeamPoints locks placePoints/rank —
+      // leave them alone until an operator explicitly unlocks, instead of
+      // silently reverting the correction on this tick.
+      if (!team.placePointsLocked) {
+        team.rank = teamRank;
+        team.placePoints = ((rank) => {
+          switch (rank) {
+            case 1: return 10;
+            case 2: return 6;
+            case 3: return 5;
+            case 4: return 4;
+            case 5: return 3;
+            case 6: return 2;
+            case 7: return 1;
+            case 8: return 1;
+            default: return 0;
+          }
+        })(teamRank);
+      }
 
       team.players = newTeamPlayers;
     }
@@ -644,10 +766,19 @@ function startLiveMatchUpdater() {
     liveMatchCache.set(cacheKey, updatedObject);
     lastFingerprintByUserMatch[cacheKey] = newFingerprint;
 
-    saveQueue.push({
-      matchId,
-      userId,
-      teams: updatedObject.teams,
+    // writeCompletion resolves once this specific job's data is CONFIRMED
+    // durable in MongoDB (see processSaveQueue) — used by pollForUser to
+    // trigger a bulkUpdate rebuild only after it's safe to re-read from the
+    // DB, without making this push/return any less fire-and-forget for the
+    // liveMatchUpdate emit right after it (which uses in-memory data only).
+    const writeCompletion = new Promise((resolve, reject) => {
+      saveQueue.push({
+        matchId,
+        userId,
+        teams: updatedObject.teams,
+        resolve,
+        reject,
+      });
     });
     processSaveQueue();
 
@@ -656,7 +787,7 @@ function startLiveMatchUpdater() {
       `${c('green', '✔ DB update queued')} for match=${matchId} user=${String(userId)}`
     );
 
-    return { data: updatedObject, changed: true };
+    return { data: updatedObject, changed: true, writeCompletion };
   };
 
   // ─── Per-User Update Pass ───────────────────────────────────────────────────
@@ -696,10 +827,29 @@ function startLiveMatchUpdater() {
         const result = await updateMatchDataWithLiveStats(selected.matchId, selUserId, apiPlayers, apiPlayersAt);
         if (!result) return;
 
-        const { data: updatedMatchData, changed } = result;
+        const { data: updatedMatchData, changed, writeCompletion } = result;
         const cacheKey    = `${String(userKey)}:${String(selected.matchId)}`;
         const memoryMatch = liveMatchCache.get(cacheKey) || updatedMatchData;
         const lastData    = lastMatchDataByUserMatch[cacheKey];
+
+        // Trigger the public/bulk broadcast (comsock.js's bulkUpdate) directly
+        // as soon as THIS write is confirmed durable, instead of waiting for
+        // the MongoDB change-stream to separately notice it — cuts out that
+        // round trip for the live-tick path specifically. Deliberately not
+        // awaited here: must never block liveMatchUpdate (below) or this
+        // loop. Must wait for writeCompletion (not fire immediately) because
+        // buildBulkPayload re-reads from MongoDB — firing before the write
+        // lands would risk broadcasting stale data. The MatchData change-
+        // stream watcher in comsock.js stays in place untouched as the
+        // trigger for writes from anywhere else (manual corrections, etc).
+        if (writeCompletion) {
+          writeCompletion
+            .then(() => {
+              bustCache(String(selected.matchId), String(selected.tournamentId), String(selected.roundId));
+              scheduleEmit(io, String(selected.tournamentId), String(selected.roundId), String(selected.matchId), false);
+            })
+            .catch(err => console.warn('[pubgApiMatchData] bulk trigger skipped, write failed:', err.message));
+        }
 
         // ─────────────────────────────────────────────────────────────────
         // Frontend forwarding — UNCHANGED. liveMatchUpdate/overallDataUpdate
@@ -713,6 +863,42 @@ function startLiveMatchUpdater() {
           // frame rather than queueing — always prefer the freshest data.
           // Scoped to this user's room only — other users no longer see it.
           io.to(`user:${userKey}`).volatile.emit('liveMatchUpdate', memoryMatch);
+
+          // Fast path for the PUBLIC overlay room (Bulkpublic/comsock's
+          // bulkUpdate consumers): reuses the exact same event name/shape
+          // those clients already know how to merge (isPartialTeams team
+          // diffing, effectiveMatchId targeting), but built entirely from
+          // in-memory data — no DB round trip, no waiting on writeCompletion
+          // below. Deliberately omits tournamentData/roundData/matchesData.list/
+          // overallData/matchDatasData; PublicThemeRenderer.tsx only updates
+          // the state slices a payload actually carries, so the DB-confirmed
+          // bulkUpdate that follows shortly after (via scheduleEmit) fills
+          // those back in exactly as it does today.
+          // hydrateMatchDataIdentity/applyLiveTeamDiff mutate team/player
+          // objects in place — deep-clone teams+players (not just the
+          // top-level object) so those mutations can never leak into the
+          // objects already queued in saveQueue for the MongoDB write.
+          const fastMatchData = hydrateMatchDataIdentity(
+            {
+              ...memoryMatch,
+              teams: (memoryMatch.teams || []).map(t => ({
+                ...t,
+                players: (t.players || []).map(p => ({ ...p })),
+              })),
+            },
+            selected.tournamentId
+          );
+          fastMatchData.deadTeamList = updateDeadTeamList(selected.matchId, fastMatchData);
+          const trimmedMatchData = applyLiveTeamDiff(selected.matchId, fastMatchData);
+          io.to(ROOM(String(selected.tournamentId), String(selected.roundId))).volatile.emit(
+            'bulkUpdate',
+            encodeMsgpack({
+              matchesData: { effectiveMatchId: String(selected.matchId) },
+              currentMatchData: { matchId: String(selected.matchId), matchData: trimmedMatchData },
+              updatedAt: new Date(),
+            })
+          );
+
           try {
             const overallTeams = await computeOverallMatchDataForRound(
               selected.tournamentId, selected.roundId, selected.matchId, selUserId

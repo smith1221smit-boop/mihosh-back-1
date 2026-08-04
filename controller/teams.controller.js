@@ -62,6 +62,36 @@ function normalizePlayers(players) {
     }));
 }
 
+// ─── Player-identity validation ─────────────────────────────────────────
+// Every roster player needs a working PUBG playerId (uId) — the live-match
+// rebuild (pubgApiMatchData.controller.js) matches live API players into a
+// team's roster by playerId, so a missing one means that player can never
+// be found (shows up "missing" in MatchData, no photo). A playerId CAN
+// legitimately be registered on more than one team (a player rostered on
+// multiple teams across different tournaments, etc.) — that's allowed;
+// pubgApiMatchData.controller.js's uidToTeam matching resolves which team
+// a live tick's stats belong to deterministically (first team wins, with a
+// warning logged) rather than rejecting the data here.
+function validatePlayerIds(players) {
+  const list = Array.isArray(players) ? players : [];
+  const seen = new Map(); // playerId -> first index seen, to catch dupes within this same request
+
+  for (let i = 0; i < list.length; i++) {
+    const p = list[i];
+    if (!p || typeof p.playerName !== 'string' || !p.playerName.trim()) continue; // normalizePlayers drops these anyway
+    const playerId = typeof p.playerId === 'string' ? p.playerId.trim() : '';
+    if (!playerId) {
+      return { ok: false, error: `Player "${p.playerName}" is missing a playerId (PUBG ID) — every roster player needs one so live stats can be matched correctly.` };
+    }
+    if (seen.has(playerId)) {
+      return { ok: false, error: `playerId "${playerId}" is used by more than one player in this request.` };
+    }
+    seen.set(playerId, i);
+  }
+
+  return { ok: true };
+}
+
 // ─── Create a new team ───────────────────────────────────────────────────
 const createTeam = async (req, res) => {
   try {
@@ -74,6 +104,11 @@ const createTeam = async (req, res) => {
     }
     if (Array.isArray(players) && players.length > MAX_PLAYERS) {
       return res.status(400).json({ error: `players cannot exceed ${MAX_PLAYERS}` });
+    }
+
+    if (Array.isArray(players) && players.length) {
+      const validation = validatePlayerIds(players);
+      if (!validation.ok) return res.status(400).json({ error: validation.error });
     }
 
     const finalLogo = (typeof logo === 'string' && logo.trim()) ? logo : DEFAULT_TEAM_LOGO;
@@ -217,6 +252,11 @@ const updateTeam = async (req, res) => {
       return res.status(403).json({ error: 'Not authorized to update this team' });
     }
 
+    if (players) {
+      const validation = validatePlayerIds(players);
+      if (!validation.ok) return res.status(400).json({ error: validation.error });
+    }
+
     const updatedTeam = await Team.findByIdAndUpdate(
       req.params.id,
       { $set: setOps },
@@ -267,6 +307,9 @@ const addPlayerToTeam = async (req, res) => {
     }
     const { playerName, playerId, photo } = req.body;
     if (!playerName) return res.status(400).json({ error: 'Player name is required' });
+    if (typeof playerId !== 'string' || !playerId.trim()) {
+      return res.status(400).json({ error: 'playerId (PUBG ID) is required' });
+    }
 
     const finalPhoto = (typeof photo === 'string' && photo.trim()) ? photo : DEFAULT_PLAYER_PHOTO;
 
@@ -275,6 +318,9 @@ const addPlayerToTeam = async (req, res) => {
     if (!(await canMutateTeam(req, existing.createdBy))) {
       return res.status(403).json({ error: 'Not authorized to modify this team' });
     }
+
+    const validation = validatePlayerIds([{ playerName, playerId }]);
+    if (!validation.ok) return res.status(400).json({ error: validation.error });
 
     // Guard the roster size cap atomically via a conditional filter —
     // avoids a separate read just to count players.

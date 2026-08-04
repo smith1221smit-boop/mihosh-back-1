@@ -160,6 +160,81 @@ const createMatchDataForMatchDoc = async (matchOrId) => {
   }
 };
 
+// Reconciles existing MatchData docs against a Group's current slots.
+// createMatchDataForMatchDoc only ever runs once, at match-creation time —
+// if a team is added to (or swapped into) a group slot afterwards, the
+// matches that already exist for that group never learn about it. This
+// walks every such match and patches in what's missing, without touching
+// already-recorded live stats (placePoints, per-player fields) for teams
+// that are unchanged.
+const syncMatchDataTeamsForGroup = async (groupId) => {
+  try {
+    const group = await Group.findById(groupId).populate({
+      path: 'slots.team',
+      populate: { path: 'players' },
+    }).lean();
+    if (!group) return;
+
+    const matches = await Match.find({ groups: group._id }).select('_id').lean();
+    if (!matches.length) return;
+
+    const matchDatas = await MatchData.find({ matchId: { $in: matches.map(m => m._id) } });
+
+    for (const matchData of matchDatas) {
+      let changed = false;
+
+      for (const slot of group.slots || []) {
+        if (!slot.team) continue;
+
+        const existing = matchData.teams.find(
+          t => String(t.teamId) === String(slot.team._id) || t.slot === slot.slot
+        );
+
+        const freshPlayers = (slot.team.players || []).slice(0, 4)
+          .map(player => buildFreshPlayer(player, slot.slot, slot.team.teamFullName || ''));
+
+        if (!existing) {
+          // Brand new team in this slot — add it.
+          matchData.teams.push({
+            slot: slot.slot,
+            teamId: slot.team._id,
+            teamLogo: slot.team.logo || '',
+            teamName: slot.team.teamFullName || slot.team.teamName || '',
+            teamTag: slot.team.teamTag || '',
+            players: freshPlayers,
+          });
+          changed = true;
+        } else if (String(existing.teamId) !== String(slot.team._id)) {
+          // Slot's team was swapped — replace identity/roster, drop stale stats.
+          existing.teamId = slot.team._id;
+          existing.slot = slot.slot;
+          existing.teamLogo = slot.team.logo || '';
+          existing.teamName = slot.team.teamFullName || slot.team.teamName || '';
+          existing.teamTag = slot.team.teamTag || '';
+          existing.players = freshPlayers;
+          changed = true;
+        } else {
+          // Same team — only refresh display metadata, never touch live stats/roster.
+          const teamName = slot.team.teamFullName || slot.team.teamName || '';
+          const teamTag = slot.team.teamTag || '';
+          const teamLogo = slot.team.logo || '';
+          if (existing.slot !== slot.slot) { existing.slot = slot.slot; changed = true; }
+          if (existing.teamName !== teamName) { existing.teamName = teamName; changed = true; }
+          if (existing.teamTag !== teamTag) { existing.teamTag = teamTag; changed = true; }
+          if (existing.teamLogo !== teamLogo) { existing.teamLogo = teamLogo; changed = true; }
+        }
+      }
+
+      if (changed) {
+        matchData.markModified('teams');
+        await matchData.save();
+      }
+    }
+  } catch (error) {
+    console.error('Error syncing MatchData teams for group:', error);
+  }
+};
+
 // Get MatchData by matchId (user-scoped)
 const getMatchDataByMatchId = async (req, res) => {
   try {
@@ -235,7 +310,7 @@ const updateTeamPoints = async (req, res) => {
     }
     const userId = req.session.userId;
 
-    const { placePoints } = req.body;
+    const { placePoints, rank, unlock } = req.body;
     if (typeof placePoints !== 'number') {
       return res.status(400).json({ error: 'placePoints must be a number' });
     }
@@ -243,13 +318,27 @@ const updateTeamPoints = async (req, res) => {
     const teamObjId = toObjectIdOrNull(teamId);
     if (!teamObjId) return res.status(400).json({ error: 'Invalid teamId' });
 
+    // Manually correcting placePoints locks it so the live-poll scoring
+    // loop (pubgApiMatchData.controller.js) doesn't silently overwrite the
+    // correction on its next tick. Pass `unlock: true` to hand control
+    // back to auto-scoring. `rank` is optional — pass it alongside
+    // placePoints when correcting a team whose real placement also needs
+    // fixing (WWCD/standings key off rank, not placePoints).
+    const setFields = {
+      'teams.$[team].placePoints': placePoints,
+      'teams.$[team].placePointsLocked': unlock !== true,
+    };
+    if (typeof rank === 'number') {
+      setFields['teams.$[team].rank'] = rank;
+    }
+
     // Ownership + team-location + write, all in ONE atomic round trip —
     // replaces the old "fetch Match, fetch MatchData, then $set with
     // arrayFilters" 3-query sequence with a single findOneAndUpdate whose
     // own filter already proves ownership (matchData.userId === req.session.userId).
     const result = await MatchData.findOneAndUpdate(
       { _id: matchDataId, matchId, userId },
-      { $set: { 'teams.$[team].placePoints': placePoints } },
+      { $set: setFields },
       {
         new: true,
         arrayFilters: [{ $or: [{ 'team._id': teamObjId }, { 'team.teamId': teamObjId }] }],
@@ -645,6 +734,7 @@ const removePlayersFromTeamInMatchData = async (req, res) => {
 
 module.exports = {
   createMatchDataForMatchDoc,
+  syncMatchDataTeamsForGroup,
   getMatchDataByMatchId,
   updateTeamPoints,
   deleteMatchDataById,
