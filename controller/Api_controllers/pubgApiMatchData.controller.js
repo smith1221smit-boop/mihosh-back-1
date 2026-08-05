@@ -346,22 +346,6 @@ const lastFingerprintByUserMatch = {}; // stores fingerprint PARTS arrays, not h
 // socket.id -> userId, so disconnect can clean up the right entries
 const socketIdToUserId = new Map();
 
-// ─── Live Update Chunking (public overlay round room) ────────────────────────
-// The round-room broadcast used to be one big msgpack frame containing every
-// team. The client can't decode/apply ANY of it until the whole frame has
-// arrived, so a tournament with many teams paid the full transmit+decode
-// latency of the biggest team before the overlay could update even one row.
-// Splitting `teams` into small slices lets the client decode and apply the
-// first slice the instant it lands, instead of waiting on the rest.
-const TEAMS_PER_LIVE_CHUNK = 4;
-
-function chunkArray(arr, size) {
-  const chunks = [];
-  for (let i = 0; i < arr.length; i += size) chunks.push(arr.slice(i, i + size));
-  if (chunks.length === 0) chunks.push([]); // always emit at least one chunk
-  return chunks;
-}
-
 // ─── Binary Payload Decode Helper ──────────────────────────────────────────
 // The relay now sends 'totalPlayerList' as MessagePack-encoded binary
 // (Payload::Binary on the Rust side, via rmp_serde::to_vec_named) instead
@@ -597,7 +581,9 @@ function startLiveMatchUpdater() {
       );
     }
 
-    await updateTeamsWithApiPlayers(apiPlayers, matchId, userId);
+    updateTeamsWithApiPlayers(apiPlayers, matchId, userId).catch(err =>
+      console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
+    );
 
     const normalizeId = id => (id ? String(id).trim() : '');
 
@@ -949,27 +935,16 @@ function startLiveMatchUpdater() {
           // frame rather than queueing — always prefer the freshest data.
           io.to(`user:${userKey}`).volatile.emit('liveMatchUpdate', memoryMatch);
 
-          // Public overlay: same data, split into small per-team-slice frames
-          // instead of one big object — see TEAMS_PER_LIVE_CHUNK above. Each
-          // frame carries the small top-level scalar fields plus just its
-          // slice of `teams`; the client merges slices in as they arrive
-          // rather than waiting for the full set.
+          // Public overlay: emit the full match object as soon as it's ready,
+          // msgpack-encoded, in one frame.
           const roundRoom = `round:${selected.tournamentId}:${selected.roundId}`;
-          const { teams: allTeams, ...matchScalarFields } = memoryMatch;
-          const teamChunks = chunkArray(allTeams || [], TEAMS_PER_LIVE_CHUNK);
-          const totalChunks = teamChunks.length;
-          teamChunks.forEach((teamsSlice, chunkIndex) => {
-            io.to(roundRoom).volatile.emit(
-              'liveMatchUpdate',
-              encodeMsgpack({
-                ...matchScalarFields,
-                matchId: String(selected.matchId),
-                teams: teamsSlice,
-                chunkIndex,
-                totalChunks,
-              })
-            );
-          });
+          io.to(roundRoom).volatile.emit(
+            'liveMatchUpdate',
+            encodeMsgpack({
+              ...memoryMatch,
+              matchId: String(selected.matchId),
+            })
+          );
 
           try {
             const overallTeams = await computeOverallMatchDataForRound(
