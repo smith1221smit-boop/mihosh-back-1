@@ -4,22 +4,18 @@ const dotenv = require('dotenv');
 
 let envVars = {};
 
-// Prioritize process.env (Render env vars) first, then embedded, then .env
-envVars = { ...process.env };
-
-// Try embedded config second (build-time)
+// Try to load embedded config first (for production)
 try {
+  // This will be replaced during build
   const embeddedConfig = require('./env.config');
-  envVars = { ...envVars, ...embeddedConfig };
+  envVars = { ...embeddedConfig };
 } catch (e) {
-  console.log('No embedded config found (normal for dev)');
-}
-
-// Fall back to .env for local dev
-const envPath = path.join(__dirname, '..', '.env');
-if (fs.existsSync(envPath)) {
-  dotenv.config({ path: envPath });
-  envVars = { ...envVars, ...process.env };
+  // Fall back to .env file in development
+  const envPath = path.join(__dirname, '..', '.env');
+  if (fs.existsSync(envPath)) {
+    dotenv.config({ path: envPath });
+    envVars = { ...process.env };
+  }
 }
 
 // Default configuration
@@ -34,9 +30,9 @@ const config = {
   SESSION_SECRET: envVars.SESSION_SECRET || 'supersecretkey123',
   
 // Database
-  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://DEMON:1RpRCPfA2TIjcXXL@cluster0.znuinux.mongodb.net/?retryWrites=true&w=majority&appName=Cluster0',
-  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://enabled-mako-38693.upstash.io',
-  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'AZclAAIncDIwYzAxYTkyMmRlNDU0YjU5OWZjNGU5ZWQ2MDMzZTVkYnAyMzg2OTM',
+  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://demon:P6whwJ8qsMfIZg2F@cluster0.ix4q7ng.mongodb.net/?appName=Cluster0',
+  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://valid-flamingo-189638.upstash.io',
+  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAuTGAAIgcDFmOTYwYjk2NmE1MWU0MTFmYThiNmMxYWViZjAyNjZjMA',
   
   // Logging
   LOG_LEVEL: envVars.LOG_LEVEL || 'info',
