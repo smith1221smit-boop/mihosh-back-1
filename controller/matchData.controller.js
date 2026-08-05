@@ -6,6 +6,7 @@ const Group = require('../models/group.model.js');
 const { getSocket } = require('../socket.js');
 const mongoose = require('mongoose');
 const { computeOverallMatchDataForRound } = require('./overall.controller');
+const { encodeMsgpack } = require('../utils/msgpackCodec');
 
 // ─── Shared player-template builder ───────────────────────────────────────────
 // Was previously copy-pasted 3x (create / replace / add) with small drifts
@@ -93,21 +94,44 @@ function releaseLock(lockKey) {
 // resource being mutated, so there's no correctness reason to block the
 // HTTP response on it. Shaves the slowest part of every write off the
 // response time the client actually sees.
-function emitOverallUpdateAsync(io, matchId, userId) {
+//
+// Also pushes to the PUBLIC overlay room (`round:${tournamentId}:${roundId}`,
+// see PublicThemeRenderer.tsx) — msgpack-encoded binary, same event names
+// (liveMatchUpdate/overallDataUpdate) the automatic API live-tick path
+// (pubgApiMatchData.controller.js) already uses. Manual edits used to reach
+// the overlay via comsock.js's MongoDB change-stream watcher (deleted this
+// session); this is what replaces that for the manual-entry path
+// specifically. `matchData` is the caller's already-updated document —
+// passing it through avoids a redundant re-fetch.
+function emitOverallUpdateAsync(io, matchId, userId, matchData) {
+  console.log(`[socket] emitOverallUpdateAsync called matchId=${matchId} userId=${userId} hasMatchData=${!!matchData}`);
   Match.findById(matchId).lean()
     .then(match => {
-      if (!match) return;
+      if (!match) {
+        console.warn(`[socket] emitOverallUpdateAsync: no Match found for matchId=${matchId} — nothing emitted`);
+        return;
+      }
+      const room = `round:${match.tournamentId}:${match.roundId}`;
+      const socketsInRoom = io.sockets.adapter.rooms.get(room)?.size || 0;
+      console.log(`[socket] emitOverallUpdateAsync: room=${room} has ${socketsInRoom} socket(s) currently joined`);
+
+      if (matchData) {
+        io.to(room).emit('liveMatchUpdate', encodeMsgpack({ ...matchData, matchId: String(matchId) }));
+        console.log(`[socket] liveMatchUpdate -> ${room} match=${matchId}`);
+      }
+
       return computeOverallMatchDataForRound(match.tournamentId, match.roundId, matchId, userId)
         .then(overallTeams => {
-          const room = `user:${userId}`;
-          console.log(`[socket] overallDataUpdate -> ${room} match=${matchId}`);
-          io.to(room).emit('overallDataUpdate', {
+          const overallPayload = {
             tournamentId: match.tournamentId,
             roundId: match.roundId,
             matchId,
             teams: overallTeams,
             createdAt: new Date(),
-          });
+          };
+          console.log(`[socket] overallDataUpdate -> user:${userId} + ${room} match=${matchId}`);
+          io.to(`user:${userId}`).emit('overallDataUpdate', overallPayload);
+          io.to(room).emit('overallDataUpdate', encodeMsgpack(overallPayload));
         });
     })
     .catch(err => console.warn('Failed to emit overall data update:', err.message));
@@ -355,7 +379,7 @@ const updateTeamPoints = async (req, res) => {
     // secondary "overall standings" recompute below.
     res.json({ message: 'Team placePoints updated', matchDataId, teamId, changes: { placePoints } });
 
-    emitOverallUpdateAsync(io, matchId, userId);
+    emitOverallUpdateAsync(io, matchId, userId, result);
   } catch (error) {
     console.error('Error updating team points:', error);
     res.status(500).json({ error: error.message });
@@ -484,7 +508,7 @@ const updatePlayerStats = async (req, res) => {
 
     res.json({ message: 'Player stats updated', player });
 
-    emitOverallUpdateAsync(io, matchId, userId);
+    emitOverallUpdateAsync(io, matchId, userId, updated);
   } catch (error) {
     console.error('Error in updatePlayerStats:', error);
     res.status(500).json({ error: error.message });
@@ -553,7 +577,7 @@ const updateTeamPlayersBulkStats = async (req, res) => {
 
     res.json({ message: 'Team players updated', teamId, bHasDied });
 
-    emitOverallUpdateAsync(io, matchId, userId);
+    emitOverallUpdateAsync(io, matchId, userId, result);
   } catch (error) {
     console.error('Error in bulk team update:', error);
     res.status(500).json({ error: error.message });

@@ -4,6 +4,7 @@ const MatchData = require('../models/matchData.model');
 const Round = require('../models/round.model');
 const Tournament = require('../models/tournament.model');
 const { getSocket } = require('../socket');
+const { encodeMsgpack } = require('../utils/msgpackCodec');
 
 // Numeric player fields to aggregate (sum)
 const NUMERIC_PLAYER_FIELDS = [
@@ -246,47 +247,79 @@ function aggregateOverallTeams(matchDataDocs) {
   return aggregatedTeams;
 }
 
-const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, userId) => {
-  // Verify round exists (skip ownership for public routes)
-  const round = await Round.findOne({ _id: roundId, tournamentId, ...(userId && { createdBy: userId }) });
-  if (!round) throw new Error('Round not found');
+// ─── Round/Match metadata cache ───────────────────────────────────────────
+// computeOverallMatchDataForRound runs on the live-emit hot path (every
+// changed tick, per active match) and previously paid 4 DB round trips just
+// to re-verify round/match existence and re-fetch the round's match list —
+// data that essentially never changes tick-to-tick. Cache it briefly per
+// (roundId, userId); a short TTL means any real structural change (a match
+// added/removed from the round) is picked up within a few seconds instead
+// of instantly, which is an acceptable tradeoff on this path.
+const ROUND_META_TTL_MS = 5000;
+const roundMetaCache = new Map(); // `${roundId}:${userId||''}` -> { matchIds, matchIdSet, provisioned, expiresAt }
 
-  // Verify match exists (skip ownership for public routes) — matchId is only
-  // used for this existence/ownership check now, not to filter which matches
-  // count toward standings: standings are always the FULL round total (see
-  // aggregateOverallTeams), matching Bulkpublic.controller.js's behavior.
-  const targetMatch = await Match.findOne({ _id: matchId, tournamentId, roundId, ...(userId && { userId }) });
-  if (!targetMatch) throw new Error('Match not found');
+async function getRoundMeta(tournamentId, roundId, userId) {
+  const cacheKey = `${roundId}:${userId || ''}`;
+  const cached = roundMetaCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached;
+
+  // Verify round exists (skip ownership for public routes)
+  const round = await Round.findOne({ _id: roundId, tournamentId, ...(userId && { createdBy: userId }) }).lean();
+  if (!round) throw new Error('Round not found');
 
   // Fetch all matches for this tournament/round
   const matches = await Match.find({ tournamentId, roundId, ...(userId && { userId }) }, { _id: 1, matchNo: 1 }).sort({ matchNo: 1 }).lean();
-  if (!matches || matches.length === 0) {
+  const matchIds = matches.map(m => m._id);
+  const matchIdSet = new Set(matchIds.map(id => id.toString()));
+
+  const entry = { matchIds, matchIdSet, provisioned: false, expiresAt: Date.now() + ROUND_META_TTL_MS };
+  roundMetaCache.set(cacheKey, entry);
+  return entry;
+}
+
+const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, userId) => {
+  const meta = await getRoundMeta(tournamentId, roundId, userId);
+
+  // matchId existence/ownership is now a membership check against the
+  // already-scoped (tournamentId/roundId/userId) match list instead of a
+  // separate Match.findOne round trip.
+  if (!meta.matchIdSet.has(String(matchId))) throw new Error('Match not found');
+
+  const { matchIds } = meta;
+  if (!matchIds || matchIds.length === 0) {
     return [];
   }
 
-  const matchIds = matches.map(m => m._id);
+  // Ensure matchData exists for each match (create if missing). Once a
+  // round has been fully "provisioned" (every match has a MatchData doc),
+  // that stays true forever — MatchData docs are never deleted out from
+  // under a match — so skip re-checking existence on every tick and only
+  // do it once per cache window.
+  if (!meta.provisioned) {
+    const existing = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).select('_id matchId').lean();
+    const existingMap = new Map(existing.map(md => [md.matchId.toString(), md._id]));
 
-  // Ensure matchData exists for each match (create if missing to follow current pattern)
-  const existing = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).select('_id matchId').lean();
-  const existingMap = new Map(existing.map(md => [md.matchId.toString(), md._id]));
+    // Required lazily (not at module top level): matchData.controller.js also
+    // requires this file (for computeOverallMatchDataForRound), and a
+    // top-level circular require here previously left createMatchDataForMatchDoc
+    // resolved to undefined depending on which module loaded first — silently
+    // skipping MatchData creation (and that match's points) for any match that
+    // never got a MatchData doc. Requiring it here, after both modules have
+    // finished loading, always gets the real function.
+    const { createMatchDataForMatchDoc } = require('./matchData.controller');
 
-  // Required lazily (not at module top level): matchData.controller.js also
-  // requires this file (for computeOverallMatchDataForRound), and a
-  // top-level circular require here previously left createMatchDataForMatchDoc
-  // resolved to undefined depending on which module loaded first — silently
-  // skipping MatchData creation (and that match's points) for any match that
-  // never got a MatchData doc. Requiring it here, after both modules have
-  // finished loading, always gets the real function.
-  const { createMatchDataForMatchDoc } = require('./matchData.controller');
-
-  for (const m of matchIds) {
-    if (!existingMap.has(m.toString())) {
-      try {
-        await createMatchDataForMatchDoc(m);
-      } catch (e) {
-        console.warn('Could not create MatchData for match', m.toString(), e?.message || e);
+    let allPresent = true;
+    for (const m of matchIds) {
+      if (!existingMap.has(m.toString())) {
+        allPresent = false;
+        try {
+          await createMatchDataForMatchDoc(m);
+        } catch (e) {
+          console.warn('Could not create MatchData for match', m.toString(), e?.message || e);
+        }
       }
     }
+    meta.provisioned = true; // best-effort: don't retry every tick even if a create failed
   }
 
   // Load all matchData after attempting creation
@@ -313,11 +346,16 @@ const getOverallMatchDataForRound = async (req, res) => {
     // tournament's standings to every connected socket).
     try {
       const io = getSocket();
-      // Required lazily to avoid a load-order cycle with matchData.controller.js
-      const { ROOM } = require('../socket/comsock.js');
-      const room = ROOM(tournamentId, roundId);
+      const room = `round:${tournamentId}:${roundId}`;
       console.log(`[socket] overallDataUpdate -> ${room}`);
-      io.to(room).emit('overallDataUpdate', { tournamentId, roundId, matchId, teams: aggregatedTeams, createdAt: new Date() });
+      // This room is the public overlay's (PublicThemeRenderer.tsx) —
+      // it always decodes overallDataUpdate as MessagePack binary, so this
+      // MUST be encoded, unlike the plain-JSON user:${userId} emits used
+      // elsewhere for the authenticated dashboard.
+      io.to(room).emit(
+        'overallDataUpdate',
+        encodeMsgpack({ tournamentId, roundId, matchId, teams: aggregatedTeams, createdAt: new Date() })
+      );
     } catch (socketError) {
       console.warn('Failed to emit overall data via socket:', socketError.message);
     }

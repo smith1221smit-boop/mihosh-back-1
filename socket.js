@@ -46,12 +46,6 @@ function initializeSocket(server) {
   });
   console.log('✅ Socket.IO initialized with CORS');
 
-  // Bulk overlay data: rooms + MongoDB change-stream-driven live updates.
-  // Registered here so any caller of initializeSocket() gets it for free —
-  // no extra wiring needed in server.js.
-  const { registerBulkSocket } = require('./socket/comsock.js');
-  registerBulkSocket(ioInstance);
-
   return ioInstance;
 }
 
