@@ -20,14 +20,50 @@ const liveMatchCache = new Map();
 // round trip and all — on every single live tick, per match, per user, even
 // though roster/group data changes rarely. Short TTL so a roster edit is
 // still picked up within a few seconds.
+//
+// Stale-while-revalidate: on expiry, the stale cached value is returned
+// IMMEDIATELY and the refetch happens in the background instead of being
+// awaited inline. This function sits on updateMatchDataWithLiveStats's
+// critical path, which the userProcessing gate holds ticks open for — a
+// blocking cache-miss refetch every ~5s was a smaller-scale recurrence of
+// the same failure mode fixed for computeOverallMatchDataForRound: a slow
+// DB round trip on that one tick could exceed the ~2s PCOB gap and get that
+// tick silently dropped. Only the very first call for a given key (nothing
+// cached yet) still blocks, since there's no stale value to serve.
 const GROUP_CACHE_TTL_MS = 5000;
 const groupCache = new Map(); // `${tournamentId}:${userId}` -> { group, expiresAt }
+const groupRefreshInFlight = new Set(); // keys currently being refreshed in the background
+
+async function fetchGroup(tournamentId, userId) {
+  return Group.findOne({ tournamentId, userId }).populate('slots.team').lean();
+}
+
+function refreshGroupInBackground(key, tournamentId, userId) {
+  if (groupRefreshInFlight.has(key)) return;
+  groupRefreshInFlight.add(key);
+  fetchGroup(tournamentId, userId)
+    .then(group => {
+      groupCache.set(key, { group, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
+    })
+    .catch(err => {
+      console.warn(`[getGroupCached] background refresh failed for ${key}:`, err.message);
+    })
+    .finally(() => {
+      groupRefreshInFlight.delete(key);
+    });
+}
 
 async function getGroupCached(tournamentId, userId) {
   const key = `${tournamentId}:${userId}`;
   const cached = groupCache.get(key);
-  if (cached && cached.expiresAt > Date.now()) return cached.group;
-  const group = await Group.findOne({ tournamentId, userId }).populate('slots.team').lean();
+  if (cached) {
+    if (cached.expiresAt <= Date.now()) {
+      refreshGroupInBackground(key, tournamentId, userId);
+    }
+    return cached.group;
+  }
+  // First call ever for this key — nothing stale to serve, must block.
+  const group = await fetchGroup(tournamentId, userId);
   groupCache.set(key, { group, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
   return group;
 }
@@ -140,10 +176,14 @@ const chalk = {
 const c = (color, text) => `${chalk[color]}${text}${chalk.reset}`;
 
 // Full table dumps / diff tables are synchronous console writes on the hot
-// emit path, running per tick per active match — set VERBOSE_MATCH_LOGS=false
-// (e.g. on Render, where a slow log drain can add real I/O latency) to skip
-// them without touching any other behavior.
-const VERBOSE_MATCH_LOGS = process.env.VERBOSE_MATCH_LOGS !== 'false';
+// emit path, running per tick per active match — console.log is a
+// SYNCHRONOUS write whenever stdout is a non-TTY pipe (which it is on
+// Render), so a slow/backed-up log drain there blocks the single Node
+// event loop for every concurrently-running match, not just the one being
+// logged. Opt-IN only (was opt-out, i.e. on by default, which is backwards
+// for a hazard this severe) — set VERBOSE_MATCH_LOGS=true to get per-tick
+// table/diff dumps for local debugging.
+const VERBOSE_MATCH_LOGS = process.env.VERBOSE_MATCH_LOGS === 'true';
 
 // ─── Log Diff ─────────────────────────────────────────────────────────────────
 function logMatchDiff(matchId, lastData, currentData) {
@@ -320,6 +360,14 @@ function computeOverallFingerprintParts(teams) {
 }
 
 const lastOverallFingerprintByUserMatch = {};
+
+// Guards computeOverallMatchDataForRound (round-wide standings recompute —
+// scans every MatchData in the round and re-aggregates every player) from
+// running twice in parallel for the same match. This is NOT what gates
+// userProcessing/tick acceptance below — it's fire-and-forget precisely so
+// a slow round-wide recompute can never block the next live tick from being
+// accepted (see emitUpdates).
+const overallRecomputeInFlight = new Set(); // cacheKey (userKey:matchId)
 
 // ─── Event Debounce / Concurrency Guards ──────────────────────────────────────
 const EVENT_DEBOUNCE_MS = 150;   // coalesce bursts of rapid game-tick pushes per user
@@ -546,9 +594,12 @@ function startLiveMatchUpdater() {
   // ─── Core Match Update ──────────────────────────────────────────────────────
   const updateMatchDataWithLiveStats = async (matchId, userId, apiPlayers, apiPlayersAt) => {
     // These two queries don't depend on each other — run in parallel.
-    // .lean() on the selection query since we only read from it here.
+    // Both .lean() — matchData is never saved directly here (writes go
+    // through the bulkWrite saveQueue below), so the Mongoose document
+    // hydration/change-tracking overhead was paid every ~2s tick for
+    // nothing; team mutations below just operate on the plain object.
     const [matchData, selectedMatch] = await Promise.all([
-      MatchData.findOne({ matchId, userId }),
+      MatchData.findOne({ matchId, userId }).lean(),
       MatchSelection.findOne({ matchId, isSelected: true, userId }).lean(),
     ]);
 
@@ -571,7 +622,7 @@ function startLiveMatchUpdater() {
 
     if (!apiPlayers?.length) {
       console.warn(`⚠️  No live player data received via socket yet for user=${userId} — skipping this cycle`);
-      return matchData.toObject();
+      return matchData;
     }
 
     const STALE_MS = 15000;
@@ -580,10 +631,6 @@ function startLiveMatchUpdater() {
         `⚠️  Player data is stale (${Math.round((Date.now() - apiPlayersAt) / 1000)}s old) for user=${userId} — relay may be disconnected`
       );
     }
-
-    updateTeamsWithApiPlayers(apiPlayers, matchId, userId).catch(err =>
-      console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
-    );
 
     const normalizeId = id => (id ? String(id).trim() : '');
 
@@ -626,15 +673,38 @@ function startLiveMatchUpdater() {
       for (const gp of gPlayers) addCandidate(normalizeId(gp.playerId), t);
     }
 
+    // Empirically observed apiTeamId -> Team mapping for THIS tick, built
+    // from the UNAMBIGUOUS players (the common case: a uid with exactly one
+    // candidate team). PUBG's live teamId is ephemeral and NOT guaranteed to
+    // equal our tournament slot number (see comment above), so rather than
+    // assuming teamId === slot, this reconstructs the real correspondence
+    // between the two from actual data every tick — since the vast majority
+    // of players are unambiguous, this reliably tells us which apiTeamId
+    // the game is currently grouping each of our teams under. Ambiguous
+    // uids (and zero-candidate/unregistered players) below are resolved
+    // against this instead of the raw slot-number assumption.
+    const apiTeamIdToTeam = new Map(); // Number(apiTeamId) -> Team
+    for (const apiPlayer of apiPlayers) {
+      const uid = normalizeId(apiPlayer.uId);
+      if (!uid) continue;
+      const candidates = uidToCandidateTeams.get(uid);
+      if (!candidates || candidates.length !== 1) continue;
+      const apiTeamId = Number(apiPlayer.teamId);
+      if (!Number.isNaN(apiTeamId) && !apiTeamIdToTeam.has(apiTeamId)) {
+        apiTeamIdToTeam.set(apiTeamId, candidates[0]);
+      }
+    }
+
     // Resolves which team a uId belongs to for THIS tick, given its
     // candidate teams. Unambiguous case (1 candidate) is untouched — same
     // outcome as the old single-answer uidToTeam map. For a genuinely
     // ambiguous uId (>1 candidate), priority order:
     //  1. Continuity — if this MATCH already established the uid under one
     //     of the candidates on an earlier tick, stay on it (no flip-flopping).
-    //  2. The live API's own teamId for this tick, matched against a
-    //     candidate's tournament slot — freshest ground truth for "which
-    //     team is the game itself grouping them under right now."
+    //  2. The empirical apiTeamId -> Team mapping built above from this
+    //     tick's own unambiguous players — freshest ground truth for "which
+    //     team is the game itself grouping them under right now," without
+    //     assuming apiTeamId equals our tournament slot number.
     //  3. Deterministic (lowest slot) + logged fallback, only if neither
     //     signal resolves cleanly, so it never flickers and is visible in
     //     logs for a manual check.
@@ -645,9 +715,8 @@ function startLiveMatchUpdater() {
       const established = candidates.find(t => (t.players || []).some(p => normalizeId(p.uId) === uid));
       if (established) return established;
 
-      const apiTeamId = Number(apiTeamIdRaw);
-      const slotMatches = candidates.filter(t => Number(t.slot) === apiTeamId);
-      if (slotMatches.length === 1) return slotMatches[0];
+      const empirical = apiTeamIdToTeam.get(Number(apiTeamIdRaw));
+      if (empirical && candidates.includes(empirical)) return empirical;
 
       const fallback = [...candidates].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0))[0];
       console.warn(`[pubgApiMatchData] uId ${uid} ambiguous across teams [${candidates.map(t => t.teamId).join(', ')}] in match ${matchId} — no established/live-teamId signal resolved it, defaulting to team ${fallback.teamId}`);
@@ -672,12 +741,42 @@ function startLiveMatchUpdater() {
       if (resolved) {
         const list = apiPlayersByResolvedTeam.get(resolved);
         if (list) list.push(p); else apiPlayersByResolvedTeam.set(resolved, [p]);
+        continue;
+      }
+      // Zero-candidate (totally unregistered) player: prefer the empirical
+      // apiTeamId -> Team mapping (this tick's real teamId<->team
+      // correspondence) over the raw slot-number guess — the same
+      // ephemeral-teamId-≠-slot problem applies here too.
+      const apiTeamId = Number(p.teamId);
+      const empiricalTeam = apiTeamIdToTeam.get(apiTeamId);
+      if (empiricalTeam) {
+        const list = apiPlayersByResolvedTeam.get(empiricalTeam);
+        if (list) list.push(p); else apiPlayersByResolvedTeam.set(empiricalTeam, [p]);
       } else {
-        const slot = Number(p.teamId);
-        const list = apiPlayersBySlotFallback.get(slot);
-        if (list) list.push(p); else apiPlayersBySlotFallback.set(slot, [p]);
+        const list = apiPlayersBySlotFallback.get(apiTeamId);
+        if (list) list.push(p); else apiPlayersBySlotFallback.set(apiTeamId, [p]);
       }
     }
+
+    // Feed the (permanent, DB-level) roster-registration path the
+    // ALREADY-RESOLVED team assignment computed above, instead of letting
+    // it re-derive team membership itself from apiPlayer.teamId — that
+    // used to independently assume apiTeamId === tournament slot, which
+    // could permanently add an unrelated squad's players to the wrong
+    // team's roster whenever their ephemeral in-match teamId happened to
+    // collide with our slot number. Deliberately excludes
+    // apiPlayersBySlotFallback — those are players with zero roster
+    // candidates AND no empirical apiTeamId signal this tick, i.e. no
+    // reliable basis at all for a PERMANENT roster write.
+    const resolvedPlayersByTeamId = new Map(); // teamDbId(string) -> apiPlayer[]
+    for (const [team, players] of apiPlayersByResolvedTeam) {
+      const teamDbId = String(team.teamId);
+      const list = resolvedPlayersByTeamId.get(teamDbId);
+      if (list) list.push(...players); else resolvedPlayersByTeamId.set(teamDbId, [...players]);
+    }
+    updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId, userId).catch(err =>
+      console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
+    );
 
     for (const team of matchData.teams) {
       const newTeamPlayers = [];
@@ -805,45 +904,16 @@ function startLiveMatchUpdater() {
         })(teamRank);
       }
 
-      // Pad up to a full roster with registered-but-not-observed-this-match
-      // players (bench/sub, or genuinely didn't queue) so the team never
-      // shows fewer than its registered slot count. Zero-stat placeholders,
-      // tagged didNotPlay so downstream elimination logic can tell them
-      // apart from a real player who is simply alive with liveState 0.
-      // Runs AFTER teamRank/placePoints above, so these never factor into
-      // that math.
-      for (const grpPlayer of groupPlayers) {
-        if (newTeamPlayers.length >= 4) break;
-        const uid = normalizeId(grpPlayer.playerId);
-        if (!uid || usedUIds.has(uid)) continue;
-        newTeamPlayers.push({
-          _id: new mongoose.Types.ObjectId(),
-          uId: uid,
-          playerName: grpPlayer.playerName || '',
-          picUrl: grpPlayer.photo || '',
-          showPicUrl: '',
-          teamIdfromApi: team.slot,
-          location: { x: 0, y: 0, z: 0 },
-          bHasDied: false,
-          health: 0, healthMax: 100, liveState: 0,
-          killNum: 0, killNumBeforeDie: 0, damage: 0, assists: 0, knockouts: 0,
-          headShotNum: 0, survivalTime: 0, isFiring: false, isOutsideBlueCircle: false,
-          inDamage: 0, driveDistance: 0, marchDistance: 0, outsideBlueCircleTime: 0,
-          rescueTimes: 0, gotAirDropNum: 0, maxKillDistance: 0, killNumInVehicle: 0,
-          killNumByGrenade: 0, AIKillNum: 0, BossKillNum: 0, useSmokeGrenadeNum: 0,
-          useFragGrenadeNum: 0, useBurnGrenadeNum: 0, useFlashGrenadeNum: 0,
-          PoisonTotalDamage: 0, UseSelfRescueTime: 0, UseEmergencyCallTime: 0, heal: 0,
-          teamName: team.teamTag || '', character: 'None', playerKey: 0,
-          rank: null,
-          didNotPlay: true,
-        });
-        usedUIds.add(uid);
-      }
-
+      // team.players reflects only players actually reported live by the
+      // API this tick — no backfilling from the registered roster. A team
+      // with fewer live players than its roster size simply has fewer
+      // entries here; see isTeamAllDead (Bulkpublic.controller.js) and its
+      // frontend mirror (PublicThemeRenderer.tsx) for how elimination is
+      // detected without assuming a fixed 4-player array.
       team.players = newTeamPlayers;
     }
 
-    const updatedObject = matchData.toObject();
+    const updatedObject = matchData;
     const cacheKey = `${String(userId)}:${String(matchId)}`;
 
     // Skip the DB write (and cache overwrite) entirely if nothing tracked
@@ -927,25 +997,23 @@ function startLiveMatchUpdater() {
         //      (PublicThemeRenderer.tsx), msgpack-encoded binary, no login
         //      required. Always the FULL match/standings object, never a
         //      diff — a missed tick just gets caught up by the next one.
+        //
+        // computeOverallMatchDataForRound (round-wide standings) is fired
+        // WITHOUT being awaited — it scans every MatchData in the round and
+        // re-aggregates every player, easily the most expensive step here,
+        // and this function's caller (pollForUser) is what `userProcessing`
+        // gates tick-acceptance on. Awaiting it here used to mean a slow
+        // round (many matches) could make a single tick's processing take
+        // longer than the ~2s gap between PCOB ticks, silently dropping the
+        // next tick for this user since userProcessing was still held.
+        // overallRecomputeInFlight prevents two recomputes for the same
+        // match stacking if a tick arrives while the previous one is still
+        // running — it just skips that tick's recompute rather than queuing
+        // or blocking; the next changed tick will try again.
         // ─────────────────────────────────────────────────────────────────
-        const emitUpdates = async () => {
-          memoryMatch.deadTeamList = updateDeadTeamList(selected.matchId, memoryMatch);
-
-          // volatile: if a client's socket buffer is backed up, drop this
-          // frame rather than queueing — always prefer the freshest data.
-          io.to(`user:${userKey}`).volatile.emit('liveMatchUpdate', memoryMatch);
-
-          // Public overlay: emit the full match object as soon as it's ready,
-          // msgpack-encoded, in one frame.
-          const roundRoom = `round:${selected.tournamentId}:${selected.roundId}`;
-          io.to(roundRoom).volatile.emit(
-            'liveMatchUpdate',
-            encodeMsgpack({
-              ...memoryMatch,
-              matchId: String(selected.matchId),
-            })
-          );
-
+        const emitOverallUpdate = async () => {
+          if (overallRecomputeInFlight.has(cacheKey)) return;
+          overallRecomputeInFlight.add(cacheKey);
           try {
             const overallTeams = await computeOverallMatchDataForRound(
               selected.tournamentId, selected.roundId, selected.matchId, selUserId
@@ -970,17 +1038,42 @@ function startLiveMatchUpdater() {
             }
           } catch (overallError) {
             console.warn('Failed to compute overall data:', overallError.message);
+          } finally {
+            overallRecomputeInFlight.delete(cacheKey);
           }
+        };
+
+        const emitUpdates = () => {
+          memoryMatch.deadTeamList = updateDeadTeamList(selected.matchId, memoryMatch);
+
+          // volatile: if a client's socket buffer is backed up, drop this
+          // frame rather than queueing — always prefer the freshest data.
+          io.to(`user:${userKey}`).volatile.emit('liveMatchUpdate', memoryMatch);
+
+          // Public overlay: emit the full match object as soon as it's ready,
+          // msgpack-encoded, in one frame.
+          const roundRoom = `round:${selected.tournamentId}:${selected.roundId}`;
+          io.to(roundRoom).volatile.emit(
+            'liveMatchUpdate',
+            encodeMsgpack({
+              ...memoryMatch,
+              matchId: String(selected.matchId),
+            })
+          );
+
+          emitOverallUpdate().catch(err =>
+            console.error(`[overall] ${cacheKey} error:`, err.message)
+          );
         };
 
         if (!lastData) {
           if (VERBOSE_MATCH_LOGS) logFullMatchTable(memoryMatch);
-          await emitUpdates();
+          emitUpdates();
           lastMatchDataByUserMatch[cacheKey] = memoryMatch;
           hadChanges = true;
         } else if (changed) {
           if (VERBOSE_MATCH_LOGS) logMatchDiff(selected.matchId, lastData, memoryMatch);
-          await emitUpdates();
+          emitUpdates();
           lastMatchDataByUserMatch[cacheKey] = memoryMatch;
           hadChanges = true;
         } else if (VERBOSE_MATCH_LOGS) {
