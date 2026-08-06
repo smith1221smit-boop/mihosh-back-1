@@ -53,13 +53,7 @@ const playerStatsSchema = new Schema({
   teamIdfromApi: String,
   teamId: { type: Number, default: 0 },
   teamName: { type: String, default: '' },
-  contribution: { type: Number, default: 0 },
-  // True only when this tick resolved the player via roster identity or the
-  // empirical apiTeamId<->team mapping. False/absent means the placement
-  // came from (or predates) the raw teamId-as-slot last-resort guess, which
-  // must NOT be trusted as "established" continuity on later ticks — see
-  // uidToCandidateTeams / resolveTeamForUid in pubgApiMatchData.controller.js.
-  teamSourceConfident: { type: Boolean, default: false }
+  contribution: { type: Number, default: 0 }
 }, { _id: true }); // ✅ default _id for each player
 
 //

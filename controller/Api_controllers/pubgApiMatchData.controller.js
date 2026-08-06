@@ -666,28 +666,6 @@ function startLiveMatchUpdater() {
 
     const normalizeId = id => (id ? String(id).trim() : '');
 
-    // Build a uId -> CANDIDATE teams index so live players are matched to
-    // their team by roster identity first. A uId normally has exactly one
-    // candidate (the common case — unchanged behavior). It can legitimately
-    // have more than one when a player is registered on two teams' rosters
-    // at once (e.g. a transfer where the old team's roster entry was never
-    // removed) — see resolveTeamForUid below for how that ambiguity gets
-    // broken using actual match signals instead of guessing from array
-    // order. PUBG's live apiPlayer.teamId is an ephemeral in-game team id
-    // assigned by the game server for that match — it is NOT guaranteed to
-    // equal our tournament-assigned team.slot, so using slot equality as
-    // the GENERAL primary join key can bucket a team's players onto the
-    // wrong team; it's only trusted below as a tiebreaker among a short,
-    // already-known candidate list, and as the fallback for players with
-    // zero candidates.
-    const uidToCandidateTeams = new Map(); // uid -> Team[] (de-duped, insertion order)
-    function addCandidate(uid, team) {
-      if (!uid) return;
-      const list = uidToCandidateTeams.get(uid) || [];
-      if (!list.includes(team)) list.push(team);
-      uidToCandidateTeams.set(uid, list);
-    }
-
     // Pre-index group.slots by team _id once, instead of a linear
     // `group.slots.find(...)` scan per team below (was O(teams × slots)).
     const groupSlotByTeamId = new Map();
@@ -695,147 +673,48 @@ function startLiveMatchUpdater() {
       if (s.team?._id) groupSlotByTeamId.set(s.team._id.toString(), s);
     }
 
+    // groupPlayers per team — used only to enrich a live player's
+    // name/photo/openId (see the matchPlayer/grpPlayer lookups below),
+    // never for team routing.
     const teamGroupPlayers = new Map(); // teamId (string) -> groupPlayers[]
     for (const t of matchData.teams) {
       const gSlot = groupSlotByTeamId.get(t.teamId.toString());
-      const gPlayers = gSlot?.team?.players || [];
-      teamGroupPlayers.set(String(t.teamId), gPlayers);
-
-      // Only a CONFIDENTLY-resolved prior placement counts as "established"
-      // continuity — a player who only ever landed here via the raw
-      // teamId-as-slot fallback guess (or predates this field entirely)
-      // must not be treated as ground truth on later ticks, or a single
-      // coincidental teamId/slot collision sticks forever (see
-      // resolveTeamForUid below).
-      for (const p of t.players || []) {
-        if (p.teamSourceConfident !== true) continue;
-        addCandidate(normalizeId(p.uId), t);
-      }
-      for (const gp of gPlayers) addCandidate(normalizeId(gp.playerId), t);
+      teamGroupPlayers.set(String(t.teamId), gSlot?.team?.players || []);
     }
 
-    // Empirically observed apiTeamId -> Team mapping for THIS tick, built
-    // from the UNAMBIGUOUS players (the common case: a uid with exactly one
-    // candidate team). PUBG's live teamId is ephemeral and NOT guaranteed to
-    // equal our tournament slot number (see comment above), so rather than
-    // assuming teamId === slot, this reconstructs the real correspondence
-    // between the two from actual data every tick — since the vast majority
-    // of players are unambiguous, this reliably tells us which apiTeamId
-    // the game is currently grouping each of our teams under. Ambiguous
-    // uids (and zero-candidate/unregistered players) below are resolved
-    // against this instead of the raw slot-number assumption.
-    const apiTeamIdToTeam = new Map(); // Number(apiTeamId) -> Team
-    for (const apiPlayer of apiPlayers) {
-      const uid = normalizeId(apiPlayer.uId);
-      if (!uid) continue;
-      const candidates = uidToCandidateTeams.get(uid);
-      if (!candidates || candidates.length !== 1) continue;
-      const apiTeamId = Number(apiPlayer.teamId);
-      if (!Number.isNaN(apiTeamId) && !apiTeamIdToTeam.has(apiTeamId)) {
-        apiTeamIdToTeam.set(apiTeamId, candidates[0]);
-      }
-    }
-
-    // Resolves which team a uId belongs to for THIS tick, given its
-    // candidate teams. Unambiguous case (1 candidate) is untouched — same
-    // outcome as the old single-answer uidToTeam map. For a genuinely
-    // ambiguous uId (>1 candidate), priority order:
-    //  1. Continuity — if this MATCH already established the uid under one
-    //     of the candidates on an earlier tick, stay on it (no flip-flopping).
-    //  2. The empirical apiTeamId -> Team mapping built above from this
-    //     tick's own unambiguous players — freshest ground truth for "which
-    //     team is the game itself grouping them under right now," without
-    //     assuming apiTeamId equals our tournament slot number.
-    //  3. Deterministic (lowest slot) + logged fallback, only if neither
-    //     signal resolves cleanly, so it never flickers and is visible in
-    //     logs for a manual check.
-    function resolveTeamForUid(uid, apiTeamIdRaw, candidates) {
-      if (!candidates || candidates.length === 0) return null;
-      if (candidates.length === 1) return candidates[0];
-
-      const established = candidates.find(t => (t.players || []).some(p => normalizeId(p.uId) === uid && p.teamSourceConfident === true));
-      if (established) return established;
-
-      const empirical = apiTeamIdToTeam.get(Number(apiTeamIdRaw));
-      if (empirical && candidates.includes(empirical)) return empirical;
-
-      const fallback = [...candidates].sort((a, b) => (a.slot ?? 0) - (b.slot ?? 0))[0];
-      console.warn(`[pubgApiMatchData] uId ${uid} ambiguous across teams [${candidates.map(t => t.teamId).join(', ')}] in match ${matchId} — no established/live-teamId signal resolved it, defaulting to team ${fallback.teamId}`);
-      return fallback;
-    }
-
-    const resolvedTeamByUid = new Map();
-    for (const apiPlayer of apiPlayers) {
-      const uid = normalizeId(apiPlayer.uId);
-      if (!uid || resolvedTeamByUid.has(uid)) continue;
-      const team = resolveTeamForUid(uid, apiPlayer.teamId, uidToCandidateTeams.get(uid));
-      if (team) resolvedTeamByUid.set(uid, team);
-    }
-
-    // Single pass over apiPlayers instead of two `.filter()` scans PER team
-    // (was O(teams × players); now O(players + teams)).
-    const apiPlayersByResolvedTeam = new Map(); // Team -> apiPlayer[]
-    const apiPlayersBySlotFallback = new Map(); // slot(Number) -> apiPlayer[]
+    // Team routing is a pure function of THIS tick: every apiPlayer sharing
+    // the same live apiPlayer.teamId is one in-game squad, grouped together
+    // and attached, as a whole, to the ONE tournament team whose slot
+    // number equals that teamId. Deterministic and stateless — unlike a
+    // roster/continuity-based resolver, nothing here depends on what a
+    // previous tick (or the roster) decided, so a bad read can never get
+    // permanently "stuck": every tick re-derives fresh from the live
+    // payload.
+    const apiPlayersByTeamId = new Map(); // Number(apiTeamId) -> apiPlayer[]
     for (const p of apiPlayers) {
-      const uid = normalizeId(p.uId);
-      const resolved = resolvedTeamByUid.get(uid);
-      if (resolved) {
-        const list = apiPlayersByResolvedTeam.get(resolved);
-        if (list) list.push(p); else apiPlayersByResolvedTeam.set(resolved, [p]);
-        continue;
-      }
-      // Zero-candidate (totally unregistered) player: prefer the empirical
-      // apiTeamId -> Team mapping (this tick's real teamId<->team
-      // correspondence) over the raw slot-number guess — the same
-      // ephemeral-teamId-≠-slot problem applies here too.
       const apiTeamId = Number(p.teamId);
-      const empiricalTeam = apiTeamIdToTeam.get(apiTeamId);
-      if (empiricalTeam) {
-        const list = apiPlayersByResolvedTeam.get(empiricalTeam);
-        if (list) list.push(p); else apiPlayersByResolvedTeam.set(empiricalTeam, [p]);
-      } else {
-        const list = apiPlayersBySlotFallback.get(apiTeamId);
-        if (list) list.push(p); else apiPlayersBySlotFallback.set(apiTeamId, [p]);
-      }
+      if (Number.isNaN(apiTeamId)) continue;
+      const list = apiPlayersByTeamId.get(apiTeamId);
+      if (list) list.push(p); else apiPlayersByTeamId.set(apiTeamId, [p]);
     }
 
-    // Exact apiPlayer objects that only ever landed via the raw
-    // teamId-as-slot last-resort guess — used below to mark
-    // teamSourceConfident: false on those players, so a coincidental
-    // collision this tick can never masquerade as "established" identity
-    // on a later tick (see the addCandidate/`established` guards above).
-    const fallbackResolvedApiPlayers = new Set(
-      [...apiPlayersBySlotFallback.values()].flat()
-    );
-
-    // Feed the (permanent, DB-level) roster-registration path the
-    // ALREADY-RESOLVED team assignment computed above, instead of letting
-    // it re-derive team membership itself from apiPlayer.teamId — that
-    // used to independently assume apiTeamId === tournament slot, which
-    // could permanently add an unrelated squad's players to the wrong
-    // team's roster whenever their ephemeral in-match teamId happened to
-    // collide with our slot number. Deliberately excludes
-    // apiPlayersBySlotFallback — those are players with zero roster
-    // candidates AND no empirical apiTeamId signal this tick, i.e. no
-    // reliable basis at all for a PERMANENT roster write.
+    // Fed below with only players that ALREADY have a known identity this
+    // tick (matchPlayer from a prior tick, or grpPlayer from the admin
+    // roster) — kept deliberately conservative, unlike live-display
+    // routing above. This permanent, cross-tournament roster was
+    // specifically hardened once against blindly trusting
+    // apiTeamId === slot: an unrelated squad's ephemeral teamId colliding
+    // with a team's slot number used to permanently corrupt the wrong
+    // team's roster. A bare teamId/slot match on a never-before-seen uid
+    // is not reliable enough grounds for a PERMANENT roster write.
     const resolvedPlayersByTeamId = new Map(); // teamDbId(string) -> apiPlayer[]
-    for (const [team, players] of apiPlayersByResolvedTeam) {
-      const teamDbId = String(team.teamId);
-      const list = resolvedPlayersByTeamId.get(teamDbId);
-      if (list) list.push(...players); else resolvedPlayersByTeamId.set(teamDbId, [...players]);
-    }
-    updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId, userId).catch(err =>
-      console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
-    );
 
     for (const team of matchData.teams) {
       const newTeamPlayers = [];
       const usedUIds = new Set();
 
       const groupPlayers = teamGroupPlayers.get(String(team.teamId)) || [];
-      const knownTeamApiPlayers = apiPlayersByResolvedTeam.get(team) || [];
-      const fallbackApiPlayers = apiPlayersBySlotFallback.get(Number(team.slot)) || [];
-      const teamApiPlayers = [...knownTeamApiPlayers, ...fallbackApiPlayers];
+      const teamApiPlayers = apiPlayersByTeamId.get(Number(team.slot)) || [];
       const matchDataByUid = new Map((team.players || []).map(p => [normalizeId(p.uId), p]));
 
       for (const apiPlayer of teamApiPlayers) {
@@ -911,8 +790,11 @@ function startLiveMatchUpdater() {
             teamName:              apiPlayer.teamName             || '',
             character:             apiPlayer.character            || 'None',
             playerKey:             apiPlayer.playerKey            || 0,
-            teamSourceConfident:   !fallbackResolvedApiPlayers.has(apiPlayer),
           };
+
+          const teamDbId = String(team.teamId);
+          const list = resolvedPlayersByTeamId.get(teamDbId);
+          if (list) list.push(apiPlayer); else resolvedPlayersByTeamId.set(teamDbId, [apiPlayer]);
         } else {
           finalPlayer = {
             ...apiPlayer,
@@ -924,7 +806,6 @@ function startLiveMatchUpdater() {
             picUrl:        apiPlayer.picUrl || '',
             showPicUrl:    '',
             playerName:    apiPlayer.playerName,
-            teamSourceConfident: !fallbackResolvedApiPlayers.has(apiPlayer),
           };
         }
 
@@ -964,6 +845,10 @@ function startLiveMatchUpdater() {
       // detected without assuming a fixed 4-player array.
       team.players = newTeamPlayers;
     }
+
+    updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId, userId).catch(err =>
+      console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
+    );
 
     const updatedObject = matchData;
     const cacheKey = `${String(userId)}:${String(matchId)}`;
