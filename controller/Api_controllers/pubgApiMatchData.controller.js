@@ -701,7 +701,16 @@ function startLiveMatchUpdater() {
       const gPlayers = gSlot?.team?.players || [];
       teamGroupPlayers.set(String(t.teamId), gPlayers);
 
-      for (const p of t.players || []) addCandidate(normalizeId(p.uId), t);
+      // Only a CONFIDENTLY-resolved prior placement counts as "established"
+      // continuity — a player who only ever landed here via the raw
+      // teamId-as-slot fallback guess (or predates this field entirely)
+      // must not be treated as ground truth on later ticks, or a single
+      // coincidental teamId/slot collision sticks forever (see
+      // resolveTeamForUid below).
+      for (const p of t.players || []) {
+        if (p.teamSourceConfident !== true) continue;
+        addCandidate(normalizeId(p.uId), t);
+      }
       for (const gp of gPlayers) addCandidate(normalizeId(gp.playerId), t);
     }
 
@@ -744,7 +753,7 @@ function startLiveMatchUpdater() {
       if (!candidates || candidates.length === 0) return null;
       if (candidates.length === 1) return candidates[0];
 
-      const established = candidates.find(t => (t.players || []).some(p => normalizeId(p.uId) === uid));
+      const established = candidates.find(t => (t.players || []).some(p => normalizeId(p.uId) === uid && p.teamSourceConfident === true));
       if (established) return established;
 
       const empirical = apiTeamIdToTeam.get(Number(apiTeamIdRaw));
@@ -789,6 +798,15 @@ function startLiveMatchUpdater() {
         if (list) list.push(p); else apiPlayersBySlotFallback.set(apiTeamId, [p]);
       }
     }
+
+    // Exact apiPlayer objects that only ever landed via the raw
+    // teamId-as-slot last-resort guess — used below to mark
+    // teamSourceConfident: false on those players, so a coincidental
+    // collision this tick can never masquerade as "established" identity
+    // on a later tick (see the addCandidate/`established` guards above).
+    const fallbackResolvedApiPlayers = new Set(
+      [...apiPlayersBySlotFallback.values()].flat()
+    );
 
     // Feed the (permanent, DB-level) roster-registration path the
     // ALREADY-RESOLVED team assignment computed above, instead of letting
@@ -893,6 +911,7 @@ function startLiveMatchUpdater() {
             teamName:              apiPlayer.teamName             || '',
             character:             apiPlayer.character            || 'None',
             playerKey:             apiPlayer.playerKey            || 0,
+            teamSourceConfident:   !fallbackResolvedApiPlayers.has(apiPlayer),
           };
         } else {
           finalPlayer = {
@@ -905,6 +924,7 @@ function startLiveMatchUpdater() {
             picUrl:        apiPlayer.picUrl || '',
             showPicUrl:    '',
             playerName:    apiPlayer.playerName,
+            teamSourceConfident: !fallbackResolvedApiPlayers.has(apiPlayer),
           };
         }
 
