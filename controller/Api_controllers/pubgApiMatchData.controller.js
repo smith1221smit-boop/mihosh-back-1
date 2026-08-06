@@ -380,7 +380,17 @@ const EVENT_DEBOUNCE_MS = 150;   // coalesce bursts of rapid game-tick pushes pe
 // case, while a single trailing fire still coalesces genuine bursts exactly
 // as before.
 const debounceStateByUser = new Map(); // userId -> { timer, pendingTrailing }
-const userProcessing = new Set();       // prevents overlapping runs per user
+
+// userId -> boolean. Presence in the map means a run is currently in
+// flight; the boolean value is a "rerun once more when this finishes" flag
+// — same size-1 coalescing pattern as debounceStateByUser's pendingTrailing
+// above. Previously a plain Set used as a drop-gate: a tick that arrived
+// while the previous one was still running (e.g. a momentary Atlas latency
+// spike, a cold cache-miss) was thrown away outright rather than delayed,
+// so the viewer had to wait for the NEXT raw PCOB tick (~2s later) to catch
+// up — reading as an irregular stall rather than a steady cadence. Now it
+// just gets coalesced into one immediate follow-up run instead of lost.
+const userProcessing = new Map();
 
 // ─── Active User Tracking ───────────────────────────────────────────────────
 // Populated purely by discovery of active MatchSelections in the DB — no
@@ -579,13 +589,35 @@ function startLiveMatchUpdater() {
     mongoose.connection.once('open', ensureIndexes);
   }
 
+  // Ticks slower than this get an always-on (not gated by VERBOSE_MATCH_LOGS)
+  // warning logged, so remaining latency variance is measurable in
+  // production instead of guessed at. Deliberately just one line per slow
+  // pass, not a per-field table — cheap enough to leave on permanently.
+  const SLOW_POLL_THRESHOLD_MS = 500;
+
   // ── Fired on every debounced socket push, scoped to ONE user ────────────
+  // Size-1 coalescing: if a new tick arrives while a previous one for this
+  // user is still running, it doesn't get dropped — it flags "run once more
+  // immediately after this finishes" (same pattern as debounceStateByUser's
+  // pendingTrailing above), so a single slow pass costs at most one extra
+  // immediate re-run instead of a full ~2s wait for the next raw PCOB tick.
   async function triggerImmediateUpdateForUser(userId) {
     if (!activeUserKeys.has(userId)) return; // not an active/polling user — ignore
-    if (userProcessing.has(userId)) return;  // already mid-flight, skip
-    userProcessing.add(userId);
+    if (userProcessing.has(userId)) {
+      userProcessing.set(userId, true);
+      return;
+    }
+    userProcessing.set(userId, false);
     try {
-      await pollForUser(userId);
+      do {
+        userProcessing.set(userId, false);
+        const startedAt = Date.now();
+        await pollForUser(userId);
+        const elapsed = Date.now() - startedAt;
+        if (elapsed > SLOW_POLL_THRESHOLD_MS) {
+          console.warn(`[perf] pollForUser(${userId}) took ${elapsed}ms`);
+        }
+      } while (userProcessing.get(userId));
     } finally {
       userProcessing.delete(userId);
     }
