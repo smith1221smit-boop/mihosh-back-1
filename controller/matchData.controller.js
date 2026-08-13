@@ -444,36 +444,92 @@ const updatePlayerStats = async (req, res) => {
       'contribution', 'location'
     ];
 
+    // These should never legitimately go negative — an operator mistyping
+    // a value (or a stray negative delta, see killNumChange below) must not
+    // be able to write a negative stat straight into MongoDB with zero
+    // validation (the schema itself has no `min` guard on these).
+    const NONNEG_NUMERIC_FIELDS = new Set([
+      'health', 'healthMax', 'liveState', 'killNumBeforeDie', 'gotAirDropNum',
+      'maxKillDistance', 'damage', 'killNumInVehicle', 'killNumByGrenade',
+      'AIKillNum', 'BossKillNum', 'rank', 'inDamage', 'headShotNum',
+      'survivalTime', 'driveDistance', 'marchDistance', 'assists',
+      'outsideBlueCircleTime', 'knockouts', 'rescueTimes', 'useSmokeGrenadeNum',
+      'useFragGrenadeNum', 'useBurnGrenadeNum', 'useFlashGrenadeNum',
+      'PoisonTotalDamage', 'UseSelfRescueTime', 'UseEmergencyCallTime',
+      'contribution',
+    ]);
+
     const setOps = {};
     allowedFields.forEach(field => {
       if (updateData[field] !== undefined) {
-        setOps[`teams.$[team].players.$[player].${field}`] = updateData[field];
+        let value = updateData[field];
+        if (NONNEG_NUMERIC_FIELDS.has(field) && typeof value === 'number') {
+          value = Math.max(0, value);
+        }
+        setOps[`teams.$[team].players.$[player].${field}`] = value;
       }
     });
 
-    const updateOps = {};
+    const arrayFilters = [
+      { $or: [{ 'team._id': teamObjId }, { 'team.teamId': teamObjId }] },
+      { 'player._id': playerObjId },
+    ];
+
+    let updated;
     if (updateData.killNumChange !== undefined) {
-      updateOps.$inc = { 'teams.$[team].players.$[player].killNum': updateData.killNumChange };
-    } else if (updateData.killNum !== undefined) {
-      setOps['teams.$[team].players.$[player].killNum'] = updateData.killNum;
-    }
-    if (Object.keys(setOps).length) updateOps.$set = setOps;
+      const change = Number(updateData.killNumChange) || 0;
+      if (change < 0) {
+        // Don't trust the caller's delta to already be floor-safe — it was
+        // computed client-side against a possibly-stale local killNum
+        // (front/src/dashboard/matchDataController.tsx's updateKillCount),
+        // and a blind $inc here could drive the real, current value
+        // negative if a live PCOB tick moved it in between. Instead,
+        // atomically apply the decrement ONLY if the CURRENT stored value
+        // (checked by Mongo itself, at write time, via the arrayFilter
+        // condition below — not a separate read-then-write race) can
+        // absorb it without crossing zero; otherwise fall through and
+        // clamp to exactly 0. Both branches remain single atomic
+        // findOneAndUpdate calls, same pattern as the rest of this
+        // endpoint.
+        updated = await MatchData.findOneAndUpdate(
+          { _id: matchDataId, matchId, userId },
+          { $inc: { 'teams.$[team].players.$[player].killNum': change }, ...(Object.keys(setOps).length ? { $set: setOps } : {}) },
+          {
+            new: true,
+            arrayFilters: [
+              arrayFilters[0],
+              { ...arrayFilters[1], 'player.killNum': { $gte: -change } },
+            ],
+          }
+        ).lean();
 
-    if (!updateOps.$set && !updateOps.$inc) {
-      return res.status(400).json({ error: 'No valid fields to update' });
-    }
-
-    const updated = await MatchData.findOneAndUpdate(
-      { _id: matchDataId, matchId, userId },
-      updateOps,
-      {
-        new: true,
-        arrayFilters: [
-          { $or: [{ 'team._id': teamObjId }, { 'team.teamId': teamObjId }] },
-          { 'player._id': playerObjId },
-        ],
+        if (!updated) {
+          updated = await MatchData.findOneAndUpdate(
+            { _id: matchDataId, matchId, userId },
+            { $set: { ...setOps, 'teams.$[team].players.$[player].killNum': 0 } },
+            { new: true, arrayFilters }
+          ).lean();
+        }
+      } else {
+        updated = await MatchData.findOneAndUpdate(
+          { _id: matchDataId, matchId, userId },
+          { $inc: { 'teams.$[team].players.$[player].killNum': change }, ...(Object.keys(setOps).length ? { $set: setOps } : {}) },
+          { new: true, arrayFilters }
+        ).lean();
       }
-    ).lean();
+    } else {
+      if (updateData.killNum !== undefined) {
+        setOps['teams.$[team].players.$[player].killNum'] = Math.max(0, Number(updateData.killNum) || 0);
+      }
+      if (!Object.keys(setOps).length) {
+        return res.status(400).json({ error: 'No valid fields to update' });
+      }
+      updated = await MatchData.findOneAndUpdate(
+        { _id: matchDataId, matchId, userId },
+        { $set: setOps },
+        { new: true, arrayFilters }
+      ).lean();
+    }
 
     if (!updated) {
       return res.status(404).json({ error: 'MatchData not found or not yours' });

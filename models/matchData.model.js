@@ -18,42 +18,53 @@ const playerStatsSchema = new Schema({
     y: { type: Number, default: 0 },
     z: { type: Number, default: 0 }
   },
-  health: { type: Number, default: 0 },
-  healthMax: { type: Number, default: 0 },
-  liveState: { type: Number, default: 0 },
-  killNum: { type: Number, default: 0 },
-  killNumBeforeDie: { type: Number, default: 0 },
+  // `min: 0` on every stat/counter below documents that none of these
+  // should ever legitimately go negative, and backstops any FUTURE write
+  // path that uses `.save()`/`.create()` (Mongoose only runs schema
+  // validators there by default — NOT on `updateOne`/`findOneAndUpdate`/
+  // `bulkWrite` unless `runValidators: true` is explicitly passed, which
+  // the existing update-based write paths don't). The actual fixes for the
+  // two known negative-value sources are the explicit application-level
+  // clamps in pubgApiMatchData.controller.js's ingestion and
+  // matchData.controller.js's updatePlayerStats — this is a backstop on
+  // top of those, not a substitute for them. Identifiers (teamId) and
+  // coordinates (location) are deliberately left unclamped.
+  health: { type: Number, default: 0, min: 0 },
+  healthMax: { type: Number, default: 0, min: 0 },
+  liveState: { type: Number, default: 0, min: 0 },
+  killNum: { type: Number, default: 0, min: 0 },
+  killNumBeforeDie: { type: Number, default: 0, min: 0 },
   playerKey: { type: String, default: '' },
-  gotAirDropNum: { type: Number, default: 0 },
-  maxKillDistance: { type: Number, default: 0 },
-  damage: { type: Number, default: 0 },
-  killNumInVehicle: { type: Number, default: 0 },
-  killNumByGrenade: { type: Number, default: 0 },
-  AIKillNum: { type: Number, default: 0 },
-  BossKillNum: { type: Number, default: 0 },
-  rank: { type: Number, default: 0 },
+  gotAirDropNum: { type: Number, default: 0, min: 0 },
+  maxKillDistance: { type: Number, default: 0, min: 0 },
+  damage: { type: Number, default: 0, min: 0 },
+  killNumInVehicle: { type: Number, default: 0, min: 0 },
+  killNumByGrenade: { type: Number, default: 0, min: 0 },
+  AIKillNum: { type: Number, default: 0, min: 0 },
+  BossKillNum: { type: Number, default: 0, min: 0 },
+  rank: { type: Number, default: 0, min: 0 },
   isOutsideBlueCircle: { type: Boolean, default: false },
-  inDamage: { type: Number, default: 0 },
-  heal: { type: Number, default: 0 },
-  headShotNum: { type: Number, default: 0 },
-  survivalTime: { type: Number, default: 0 },
-  driveDistance: { type: Number, default: 0 },
-  marchDistance: { type: Number, default: 0 },
-  assists: { type: Number, default: 0 },
-  outsideBlueCircleTime: { type: Number, default: 0 },
-  knockouts: { type: Number, default: 0 },
-  rescueTimes: { type: Number, default: 0 },
-  useSmokeGrenadeNum: { type: Number, default: 0 },
-  useFragGrenadeNum: { type: Number, default: 0 },
-  useBurnGrenadeNum: { type: Number, default: 0 },
-  useFlashGrenadeNum: { type: Number, default: 0 },
-  PoisonTotalDamage: { type: Number, default: 0 },
-  UseSelfRescueTime: { type: Number, default: 0 },
-  UseEmergencyCallTime: { type: Number, default: 0 },
+  inDamage: { type: Number, default: 0, min: 0 },
+  heal: { type: Number, default: 0, min: 0 },
+  headShotNum: { type: Number, default: 0, min: 0 },
+  survivalTime: { type: Number, default: 0, min: 0 },
+  driveDistance: { type: Number, default: 0, min: 0 },
+  marchDistance: { type: Number, default: 0, min: 0 },
+  assists: { type: Number, default: 0, min: 0 },
+  outsideBlueCircleTime: { type: Number, default: 0, min: 0 },
+  knockouts: { type: Number, default: 0, min: 0 },
+  rescueTimes: { type: Number, default: 0, min: 0 },
+  useSmokeGrenadeNum: { type: Number, default: 0, min: 0 },
+  useFragGrenadeNum: { type: Number, default: 0, min: 0 },
+  useBurnGrenadeNum: { type: Number, default: 0, min: 0 },
+  useFlashGrenadeNum: { type: Number, default: 0, min: 0 },
+  PoisonTotalDamage: { type: Number, default: 0, min: 0 },
+  UseSelfRescueTime: { type: Number, default: 0, min: 0 },
+  UseEmergencyCallTime: { type: Number, default: 0, min: 0 },
   teamIdfromApi: String,
   teamId: { type: Number, default: 0 },
   teamName: { type: String, default: '' },
-  contribution: { type: Number, default: 0 }
+  contribution: { type: Number, default: 0, min: 0 }
 }, { _id: true }); // ✅ default _id for each player
 
 //
@@ -69,11 +80,11 @@ const teamMatchDataSchema = new Schema({
     teamTag: { type: String, default: '' }, // <-- add this line
     teamLogo: { type: String, default: '' }, // <-- add this line
   slot: { type: Number, required: true }, // ✅ slot from Group
-  placePoints: { type: Number, default: 0 },
+  placePoints: { type: Number, default: 0, min: 0 },
   // Real computed placement (1 = winner), persisted alongside placePoints
   // so WWCD/standings can key off the actual rank instead of inferring a
   // win from a magic placePoints value that manual overrides can break.
-  rank: { type: Number, default: 0 },
+  rank: { type: Number, default: 0, min: 0 },
   // Set when an operator manually corrects placePoints via updateTeamPoints.
   // While true, the live-poll scoring loop leaves placePoints/rank alone
   // instead of silently overwriting the correction on the next tick.

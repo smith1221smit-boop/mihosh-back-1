@@ -347,6 +347,13 @@ function playerKeyOf(p) {
   return null;
 }
 
+// PCOB uses -1 as a "not populated yet" sentinel on at least `rank` (only
+// assigned once a player/team is eliminated) — possibly other stat fields
+// too. Plain `x || 0` doesn't catch it since -1 is truthy, so it was
+// leaking straight through to persisted/broadcast player data and showing
+// up as a literal "-1" on the overlay. Clamp explicitly at ingestion.
+const nonNeg = (v) => (typeof v === 'number' && v > 0) ? v : 0;
+
 // ─── Cheap Fingerprinting (replaces full-object MD5 hashing on hot path) ─────
 // Hashing the entire match object (including location/inventory noise) on
 // every tick is wasted CPU. We only care about the fields logMatchDiff
@@ -600,16 +607,34 @@ function startLiveMatchUpdater() {
       const isFull = data?.isFull === true || wireSeq === null;
 
       if (isFull) {
-        state.players = new Map();
-        for (const p of incomingPlayers) {
-          const uid = playerKeyOf(p);
-          if (uid != null) state.players.set(uid, p);
+        // Never regress: the pending-retry path on the relay can deliver a
+        // full snapshot for an "old" wireSeq well after newer deltas (or
+        // another full snapshot) already landed — the relay has several
+        // independent full-snapshot senders (resume-push, requestFullSnapshot's
+        // own response, a new-match reset, and a background retry loop that
+        // can take minutes to finally land), any of which can arrive out of
+        // order. Unlike the delta branch below, this used to apply
+        // unconditionally regardless of ordering, silently reverting
+        // health/liveState/bHasDied/etc. for every player it contained —
+        // the source of the rapid dead/alive-and-health-flicker bug. Now it
+        // gets the same "don't regress already-applied state" treatment:
+        // a stale full snapshot only backfills players not already known,
+        // it never overwrites fresher data.
+        const isStaleFull = wireSeq != null && state.lastReceivedSeq != null && wireSeq < state.lastReceivedSeq;
+        if (isStaleFull) {
+          for (const p of incomingPlayers) {
+            const uid = playerKeyOf(p);
+            if (uid != null && !state.players.has(uid)) state.players.set(uid, p);
+          }
+          console.debug(`[socket] stale full snapshot (wireSeq=${wireSeq} < ${state.lastReceivedSeq}) user=${userId} — merged unseen players only, did not overwrite`);
+        } else {
+          state.players = new Map();
+          for (const p of incomingPlayers) {
+            const uid = playerKeyOf(p);
+            if (uid != null) state.players.set(uid, p);
+          }
         }
         if (wireSeq != null) {
-          // Never regress: the pending-retry path on the relay can
-          // deliver a full snapshot for an "old" wireSeq well after
-          // newer deltas already landed (it reuses the wireSeq of the
-          // tick that originally escalated to it).
           state.lastReceivedSeq = state.lastReceivedSeq == null
             ? wireSeq
             : Math.max(state.lastReceivedSeq, wireSeq);
@@ -896,37 +921,38 @@ function startLiveMatchUpdater() {
             teamIdfromApi:         team.slot,
             location:              apiPlayer.location || { x: 0, y: 0, z: 0 },
             bHasDied:              apiPlayer.liveState === 5,
-            health:                apiPlayer.health               || 0,
-            healthMax:             apiPlayer.healthMax            || 100,
-            liveState:             apiPlayer.liveState            || 0,
-            killNum:               apiPlayer.killNum              || 0,
-            killNumBeforeDie:      apiPlayer.killNumBeforeDie     || 0,
-            damage:                apiPlayer.damage               || 0,
-            assists:               apiPlayer.assists              || 0,
-            knockouts:             apiPlayer.knockouts            || 0,
-            headShotNum:           apiPlayer.headShotNum          || 0,
-            survivalTime:          apiPlayer.survivalTime         || 0,
+            health:                nonNeg(apiPlayer.health),
+            healthMax:             (typeof apiPlayer.healthMax === 'number' && apiPlayer.healthMax > 0) ? apiPlayer.healthMax : 100,
+            liveState:             nonNeg(apiPlayer.liveState),
+            rank:                  nonNeg(apiPlayer.rank),
+            killNum:               nonNeg(apiPlayer.killNum),
+            killNumBeforeDie:      nonNeg(apiPlayer.killNumBeforeDie),
+            damage:                nonNeg(apiPlayer.damage),
+            assists:               nonNeg(apiPlayer.assists),
+            knockouts:             nonNeg(apiPlayer.knockouts),
+            headShotNum:           nonNeg(apiPlayer.headShotNum),
+            survivalTime:          nonNeg(apiPlayer.survivalTime),
             isFiring:              apiPlayer.isFiring             || false,
             isOutsideBlueCircle:   apiPlayer.isOutsideBlueCircle || false,
-            inDamage:              apiPlayer.inDamage             || 0,
-            driveDistance:         apiPlayer.driveDistance        || 0,
-            marchDistance:         apiPlayer.marchDistance        || 0,
-            outsideBlueCircleTime: apiPlayer.outsideBlueCircleTime|| 0,
-            rescueTimes:           apiPlayer.rescueTimes          || 0,
-            gotAirDropNum:         apiPlayer.gotAirDropNum        || 0,
-            maxKillDistance:       apiPlayer.maxKillDistance      || 0,
-            killNumInVehicle:      apiPlayer.killNumInVehicle     || 0,
-            killNumByGrenade:      apiPlayer.killNumByGrenade     || 0,
-            AIKillNum:             apiPlayer.AIKillNum            || 0,
-            BossKillNum:           apiPlayer.BossKillNum          || 0,
-            useSmokeGrenadeNum:    apiPlayer.useSmokeGrenadeNum   || 0,
-            useFragGrenadeNum:     apiPlayer.useFragGrenadeNum    || 0,
-            useBurnGrenadeNum:     apiPlayer.useBurnGrenadeNum    || 0,
-            useFlashGrenadeNum:    apiPlayer.useFlashGrenadeNum   || 0,
-            PoisonTotalDamage:     apiPlayer.PoisonTotalDamage    || 0,
-            UseSelfRescueTime:     apiPlayer.UseSelfRescueTime    || 0,
-            UseEmergencyCallTime:  apiPlayer.UseEmergencyCallTime || 0,
-            heal:                  apiPlayer.heal                 || 0,
+            inDamage:              nonNeg(apiPlayer.inDamage),
+            driveDistance:         nonNeg(apiPlayer.driveDistance),
+            marchDistance:         nonNeg(apiPlayer.marchDistance),
+            outsideBlueCircleTime: nonNeg(apiPlayer.outsideBlueCircleTime),
+            rescueTimes:           nonNeg(apiPlayer.rescueTimes),
+            gotAirDropNum:         nonNeg(apiPlayer.gotAirDropNum),
+            maxKillDistance:       nonNeg(apiPlayer.maxKillDistance),
+            killNumInVehicle:      nonNeg(apiPlayer.killNumInVehicle),
+            killNumByGrenade:      nonNeg(apiPlayer.killNumByGrenade),
+            AIKillNum:             nonNeg(apiPlayer.AIKillNum),
+            BossKillNum:           nonNeg(apiPlayer.BossKillNum),
+            useSmokeGrenadeNum:    nonNeg(apiPlayer.useSmokeGrenadeNum),
+            useFragGrenadeNum:     nonNeg(apiPlayer.useFragGrenadeNum),
+            useBurnGrenadeNum:     nonNeg(apiPlayer.useBurnGrenadeNum),
+            useFlashGrenadeNum:    nonNeg(apiPlayer.useFlashGrenadeNum),
+            PoisonTotalDamage:     nonNeg(apiPlayer.PoisonTotalDamage),
+            UseSelfRescueTime:     nonNeg(apiPlayer.UseSelfRescueTime),
+            UseEmergencyCallTime:  nonNeg(apiPlayer.UseEmergencyCallTime),
+            heal:                  nonNeg(apiPlayer.heal),
             teamId:                apiPlayer.teamId,
             teamName:              apiPlayer.teamName             || '',
             character:             apiPlayer.character            || 'None',
@@ -947,6 +973,14 @@ function startLiveMatchUpdater() {
             picUrl:        apiPlayer.picUrl || '',
             showPicUrl:    '',
             playerName:    apiPlayer.playerName,
+            // `...apiPlayer` above spreads every raw field unguarded — same
+            // -1-sentinel leak as the branch above, so re-clamp the numeric
+            // stats explicitly rather than trusting the spread.
+            health:        nonNeg(apiPlayer.health),
+            liveState:     nonNeg(apiPlayer.liveState),
+            killNum:       nonNeg(apiPlayer.killNum),
+            damage:        nonNeg(apiPlayer.damage),
+            rank:          nonNeg(apiPlayer.rank),
           };
         }
 
