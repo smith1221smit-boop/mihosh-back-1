@@ -16,7 +16,7 @@ const { updateDeadTeamList } = require('../Bulkpublic.controller');
 const liveMatchCache = new Map();
 
 // ─── Group (roster) Cache ─────────────────────────────────────────────────────
-// Group.findOne(...).populate('slots.team') was being re-run — populate
+// Group.find(...).populate('slots.team') was being re-run — populate
 // round trip and all — on every single live tick, per match, per user, even
 // though roster/group data changes rarely. Short TTL so a roster edit is
 // still picked up within a few seconds.
@@ -30,42 +30,53 @@ const liveMatchCache = new Map();
 // DB round trip on that one tick could exceed the ~2s PCOB gap and get that
 // tick silently dropped. Only the very first call for a given key (nothing
 // cached yet) still blocks, since there's no stale value to serve.
+//
+// Fetches ALL groups for (tournamentId, userId), not just one — a
+// tournament can legitimately have multiple Group documents per user
+// (e.g. "Group A" / "Group B", see group.controller.js's own
+// Group.find({tournamentId, userId}) listing endpoint). A prior version
+// used findOne here, which arbitrarily returned only one group; any team
+// whose roster actually lived in a different group silently got treated
+// as having an empty roster (groupPlayers = []) on every live tick,
+// forever — no roster photo/name fallback ever available for that team's
+// players, even though the roster data was correct. Fetching every group
+// and merging their slots (see groupSlotByTeamId below) fixes that.
 const GROUP_CACHE_TTL_MS = 5000;
-const groupCache = new Map(); // `${tournamentId}:${userId}` -> { group, expiresAt }
+const groupCache = new Map(); // `${tournamentId}:${userId}` -> { groups, expiresAt }
 const groupRefreshInFlight = new Set(); // keys currently being refreshed in the background
 
-async function fetchGroup(tournamentId, userId) {
-  return Group.findOne({ tournamentId, userId }).populate('slots.team').lean();
+async function fetchGroups(tournamentId, userId) {
+  return Group.find({ tournamentId, userId }).populate('slots.team').lean();
 }
 
 function refreshGroupInBackground(key, tournamentId, userId) {
   if (groupRefreshInFlight.has(key)) return;
   groupRefreshInFlight.add(key);
-  fetchGroup(tournamentId, userId)
-    .then(group => {
-      groupCache.set(key, { group, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
+  fetchGroups(tournamentId, userId)
+    .then(groups => {
+      groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
     })
     .catch(err => {
-      console.warn(`[getGroupCached] background refresh failed for ${key}:`, err.message);
+      console.warn(`[getGroupsCached] background refresh failed for ${key}:`, err.message);
     })
     .finally(() => {
       groupRefreshInFlight.delete(key);
     });
 }
 
-async function getGroupCached(tournamentId, userId) {
+async function getGroupsCached(tournamentId, userId) {
   const key = `${tournamentId}:${userId}`;
   const cached = groupCache.get(key);
   if (cached) {
     if (cached.expiresAt <= Date.now()) {
       refreshGroupInBackground(key, tournamentId, userId);
     }
-    return cached.group;
+    return cached.groups;
   }
   // First call ever for this key — nothing stale to serve, must block.
-  const group = await fetchGroup(tournamentId, userId);
-  groupCache.set(key, { group, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
-  return group;
+  const groups = await fetchGroups(tournamentId, userId);
+  groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
+  return groups;
 }
 
 // ─── API-Enabled Round IDs Cache ──────────────────────────────────────────────
@@ -310,6 +321,32 @@ function logFullMatchTable(matchData) {
 // time no longer stomp on each other's data.
 const liveApiPlayersByUser = new Map(); // userId -> { players, at }
 
+// ─── Relay Wire-Protocol State (delta + sequence-number tracking) ────────────
+// The relay (fetcher.rs) now sends totalPlayerList as either a full roster
+// (isFull:true) or a DELTA of only new/changed players (isFull:false), each
+// tagged with a monotonic wireSeq. This map is the single source of truth for
+// that protocol per user: which socket is currently authoritative, the
+// highest wireSeq applied, and the merged player set (keyed by uid) that
+// liveApiPlayersByUser is rebuilt from after every message.
+//
+// Keyed by userId (matching how liveApiPlayersByUser/downstream consumption
+// is keyed), but every write is gated on the incoming packet's own socket.id
+// matching .socketId — that comparison is what rejects a stale, already-
+// evicted connection's late-arriving packet (registerRelay's eviction loop
+// calls s.disconnect(true) on the old socket, but that does not retroactively
+// cancel a 'totalPlayerList' callback already queued on the event loop for
+// it). Reset wholesale on every registerRelay (fresh connection or
+// reconnect), so a connection swap never inherits stale seq/player state.
+const relayStateByUser = new Map(); // userId -> { socketId, lastReceivedSeq, players: Map<uid, playerObj> }
+
+// Mirrors fetcher.rs's player_key(): prefer uId, fall back to playerName.
+function playerKeyOf(p) {
+  if (p == null) return null;
+  if (p.uId !== undefined && p.uId !== null && p.uId !== '') return String(p.uId);
+  if (p.playerName) return String(p.playerName);
+  return null;
+}
+
 // ─── Cheap Fingerprinting (replaces full-object MD5 hashing on hot path) ─────
 // Hashing the entire match object (including location/inventory noise) on
 // every tick is wasted CPU. We only care about the fields logMatchDiff
@@ -486,6 +523,38 @@ function startLiveMatchUpdater() {
   socket.data.userId = key;
   socketIdToUserId.set(socket.id, key);
   socket.join(`user:${key}`);
+
+  // Every registration — first-ever OR a reconnect replacing a stale
+  // connection — rebinds socketId and resets lastReceivedSeq (so gap
+  // detection doesn't misjudge the new connection's sequence numbering
+  // against an old baseline), and forces an immediate full resync
+  // rather than waiting for the relay's next natural tick or for a
+  // gap to be detected.
+  //
+  // Deliberately PRESERVES the existing accumulated `players` Map
+  // (if any) rather than resetting it to empty. A prior version reset
+  // it here, which opened a window between this reset and the
+  // requested full snapshot's response actually arriving: if any tick
+  // — even a partial delta — landed in that window,
+  // updateMatchDataWithLiveStats would unconditionally rebuild every
+  // team's players array from that incomplete apiPlayers set (it does
+  // this every tick, no backfill), wiping out previously-known players
+  // (including ones no longer actively changing, e.g. already dead)
+  // and persisting that empty roster straight to MatchData. Preserving
+  // the map means the worst case during the resync window is
+  // stale-but-present data, never a false disappearance — matching how
+  // staleness is handled everywhere else in this pipeline. The eventual
+  // full-snapshot response still wholesale-replaces this map as before
+  // (see the totalPlayerList handler's isFull branch), so a genuine
+  // reset (e.g. a real new match) is unaffected.
+  const existing = relayStateByUser.get(key);
+  relayStateByUser.set(key, {
+    socketId: socket.id,
+    lastReceivedSeq: null,
+    players: existing?.players ?? new Map(),
+  });
+  socket.emit('requestFullSnapshot');
+
   console.log(c('cyan', `[socket] relay registered → user ${key} (${socket.id})`));
 });
 
@@ -496,11 +565,23 @@ function startLiveMatchUpdater() {
         return;
       }
 
+      // Reject a packet from a socket that isn't the currently-registered
+      // one for this user. registerRelay's eviction loop calls
+      // s.disconnect(true) on a superseded connection, but that does not
+      // retroactively cancel a 'totalPlayerList' callback already queued
+      // on the event loop for it — without this check, a stale packet
+      // could land AFTER the new connection has already reset
+      // relayStateByUser, corrupting its fresh seq/player baseline.
+      const state = relayStateByUser.get(userId);
+      if (!state || state.socketId !== socket.id) {
+        console.warn(
+          c('yellow', `[socket] totalPlayerList from STALE/evicted socket ${socket.id} (user=${userId}, active=${state?.socketId ?? 'none'}) — ignored`)
+        );
+        return;
+      }
+
       // Decode the MessagePack binary payload back into a plain object
-      // before anything else touches it. Everything from here down is
-      // IDENTICAL to before the wire-format change — `data` has exactly
-      // the same shape (playerInfoList / isFull) it always did, it's
-      // just arriving as decoded msgpack instead of JSON.
+      // before anything else touches it.
       let data;
       try {
         data = decodeTotalPlayerListPayload(raw);
@@ -509,17 +590,62 @@ function startLiveMatchUpdater() {
         return;
       }
 
-      // The relay sends the full roster every tick — no delta/patch
-      // merging needed, just replace the authoritative per-user snapshot
-      // wholesale each time.
-      const players = data?.playerInfoList || data || [];
+      const incomingPlayers = Array.isArray(data?.playerInfoList) ? data.playerInfoList
+        : Array.isArray(data) ? data : [];
+      const wireSeq = typeof data?.wireSeq === 'number' ? data.wireSeq : null;
+      // No wireSeq at all ⇒ an un-updated relay build that always sends
+      // the complete roster with no isFull flag — treat as full for
+      // back-compat during a mixed-version rollout, regardless of
+      // data.isFull's value.
+      const isFull = data?.isFull === true || wireSeq === null;
 
+      if (isFull) {
+        state.players = new Map();
+        for (const p of incomingPlayers) {
+          const uid = playerKeyOf(p);
+          if (uid != null) state.players.set(uid, p);
+        }
+        if (wireSeq != null) {
+          // Never regress: the pending-retry path on the relay can
+          // deliver a full snapshot for an "old" wireSeq well after
+          // newer deltas already landed (it reuses the wireSeq of the
+          // tick that originally escalated to it).
+          state.lastReceivedSeq = state.lastReceivedSeq == null
+            ? wireSeq
+            : Math.max(state.lastReceivedSeq, wireSeq);
+        }
+      } else {
+        if (state.lastReceivedSeq != null && wireSeq <= state.lastReceivedSeq) {
+          // Stale/out-of-order-low delta (e.g. a slow retry attempt that
+          // finally landed after fresher ticks already arrived) — drop
+          // it rather than risk regressing a monotonically-increasing
+          // stat field backward. Whatever it had is already superseded.
+          console.debug(`[socket] dropping out-of-order-low delta (wireSeq=${wireSeq}, already at ${state.lastReceivedSeq}) user=${userId}`);
+          return;
+        }
+        const expected = state.lastReceivedSeq == null ? null : state.lastReceivedSeq + 1;
+        if (expected !== null && wireSeq !== expected) {
+          console.warn(
+            c('yellow', `[socket] totalPlayerList GAP user=${userId}: expected wireSeq ${expected}, got ${wireSeq} — requesting resync`)
+          );
+          socket.emit('requestFullSnapshot');
+          // Still merge what DID arrive below — don't discard useful
+          // partial data while the resync is in flight.
+        }
+        for (const p of incomingPlayers) {
+          const uid = playerKeyOf(p);
+          if (uid != null) state.players.set(uid, p); // update-in-place/insert, never remove
+        }
+        state.lastReceivedSeq = wireSeq;
+      }
+
+      const players = Array.from(state.players.values());
       liveApiPlayersByUser.set(userId, { players, at: Date.now() });
 
       console.log(
         `${c('dim', `[${new Date().toLocaleTimeString()}]`)} ` +
         `${c('cyan', '📡 received totalPlayerList')} ` +
-        `(${c('bold', String(players.length))} players) user=${userId} socket=${socket.id}`
+        `(${c('bold', String(incomingPlayers.length))}/${players.length} players, ${isFull ? 'full' : 'delta'}, wireSeq=${wireSeq ?? 'n/a'}) user=${userId} socket=${socket.id}`
       );
 
       // Leading+trailing per user: bursts from ONE user's relay still
@@ -565,6 +691,15 @@ function startLiveMatchUpdater() {
       const userId = socketIdToUserId.get(socket.id);
       socketIdToUserId.delete(socket.id);
       if (!userId) return;
+
+      // Only clear relay wire-protocol state if THIS was the currently-
+      // authoritative connection for the user — a belated disconnect from
+      // an already-evicted/superseded socket must not clobber a newer
+      // connection's already-registered seq/player state.
+      const relayState = relayStateByUser.get(userId);
+      if (relayState && relayState.socketId === socket.id) {
+        relayStateByUser.delete(userId);
+      }
 
       // Only clear this user's live-data state if no other socket (e.g. a
       // reconnect already in flight, or a second device) still claims them.
@@ -646,8 +781,8 @@ function startLiveMatchUpdater() {
       return null;
     }
 
-    const group = await getGroupCached(tournamentId, userId);
-    if (!group) {
+    const groups = await getGroupsCached(tournamentId, userId);
+    if (!groups || groups.length === 0) {
       console.log('No group found for tournament:', tournamentId.toString());
       return null;
     }
@@ -666,11 +801,17 @@ function startLiveMatchUpdater() {
 
     const normalizeId = id => (id ? String(id).trim() : '');
 
-    // Pre-index group.slots by team _id once, instead of a linear
-    // `group.slots.find(...)` scan per team below (was O(teams × slots)).
+    // Pre-index every group's slots by team _id once, instead of a linear
+    // `slots.find(...)` scan per team below (was O(teams × slots)). Spans
+    // ALL groups for this tournament+user (not just one) — a team's
+    // roster can live in any of them (e.g. "Group A"/"Group B"), and a
+    // team is only ever expected to appear in one group's slots, so
+    // flattening across groups carries no meaningful collision risk.
     const groupSlotByTeamId = new Map();
-    for (const s of group.slots || []) {
-      if (s.team?._id) groupSlotByTeamId.set(s.team._id.toString(), s);
+    for (const g of groups) {
+      for (const s of g.slots || []) {
+        if (s.team?._id) groupSlotByTeamId.set(s.team._id.toString(), s);
+      }
     }
 
     // groupPlayers per team — used only to enrich a live player's
