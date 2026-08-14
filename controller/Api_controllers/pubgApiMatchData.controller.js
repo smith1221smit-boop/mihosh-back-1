@@ -396,6 +396,47 @@ function playerKeyOf(p) {
 // up as a literal "-1" on the overlay. Clamp explicitly at ingestion.
 const nonNeg = (v) => (typeof v === 'number' && v > 0) ? v : 0;
 
+// Every numeric player-stat field PCOB can supply, clamped via nonNeg (plus
+// healthMax's own positive-or-default-100 rule). Shared by both the
+// "matched to roster" and "unmatched" player branches below in
+// updateMatchDataWithLiveStats so the two field lists can't drift apart —
+// the unmatched branch previously only re-clamped 5 of these, leaving the
+// rest exposed to the same raw -1 sentinel via its `...apiPlayer` spread.
+function clampedNumericPlayerStats(apiPlayer) {
+  return {
+    health:                nonNeg(apiPlayer.health),
+    healthMax:             (typeof apiPlayer.healthMax === 'number' && apiPlayer.healthMax > 0) ? apiPlayer.healthMax : 100,
+    liveState:             nonNeg(apiPlayer.liveState),
+    rank:                  nonNeg(apiPlayer.rank),
+    killNum:               nonNeg(apiPlayer.killNum),
+    killNumBeforeDie:      nonNeg(apiPlayer.killNumBeforeDie),
+    damage:                nonNeg(apiPlayer.damage),
+    assists:               nonNeg(apiPlayer.assists),
+    knockouts:             nonNeg(apiPlayer.knockouts),
+    headShotNum:           nonNeg(apiPlayer.headShotNum),
+    survivalTime:          nonNeg(apiPlayer.survivalTime),
+    inDamage:              nonNeg(apiPlayer.inDamage),
+    driveDistance:         nonNeg(apiPlayer.driveDistance),
+    marchDistance:         nonNeg(apiPlayer.marchDistance),
+    outsideBlueCircleTime: nonNeg(apiPlayer.outsideBlueCircleTime),
+    rescueTimes:           nonNeg(apiPlayer.rescueTimes),
+    gotAirDropNum:         nonNeg(apiPlayer.gotAirDropNum),
+    maxKillDistance:       nonNeg(apiPlayer.maxKillDistance),
+    killNumInVehicle:      nonNeg(apiPlayer.killNumInVehicle),
+    killNumByGrenade:      nonNeg(apiPlayer.killNumByGrenade),
+    AIKillNum:             nonNeg(apiPlayer.AIKillNum),
+    BossKillNum:           nonNeg(apiPlayer.BossKillNum),
+    useSmokeGrenadeNum:    nonNeg(apiPlayer.useSmokeGrenadeNum),
+    useFragGrenadeNum:     nonNeg(apiPlayer.useFragGrenadeNum),
+    useBurnGrenadeNum:     nonNeg(apiPlayer.useBurnGrenadeNum),
+    useFlashGrenadeNum:    nonNeg(apiPlayer.useFlashGrenadeNum),
+    PoisonTotalDamage:     nonNeg(apiPlayer.PoisonTotalDamage),
+    UseSelfRescueTime:     nonNeg(apiPlayer.UseSelfRescueTime),
+    UseEmergencyCallTime:  nonNeg(apiPlayer.UseEmergencyCallTime),
+    heal:                  nonNeg(apiPlayer.heal),
+  };
+}
+
 // ─── Cheap Fingerprinting (replaces full-object MD5 hashing on hot path) ─────
 // Hashing the entire match object (including location/inventory noise) on
 // every tick is wasted CPU. We only care about the fields logMatchDiff
@@ -972,38 +1013,9 @@ function startLiveMatchUpdater() {
             teamIdfromApi:         team.slot,
             location:              apiPlayer.location || { x: 0, y: 0, z: 0 },
             bHasDied:              apiPlayer.liveState === 5,
-            health:                nonNeg(apiPlayer.health),
-            healthMax:             (typeof apiPlayer.healthMax === 'number' && apiPlayer.healthMax > 0) ? apiPlayer.healthMax : 100,
-            liveState:             nonNeg(apiPlayer.liveState),
-            rank:                  nonNeg(apiPlayer.rank),
-            killNum:               nonNeg(apiPlayer.killNum),
-            killNumBeforeDie:      nonNeg(apiPlayer.killNumBeforeDie),
-            damage:                nonNeg(apiPlayer.damage),
-            assists:               nonNeg(apiPlayer.assists),
-            knockouts:             nonNeg(apiPlayer.knockouts),
-            headShotNum:           nonNeg(apiPlayer.headShotNum),
-            survivalTime:          nonNeg(apiPlayer.survivalTime),
+            ...clampedNumericPlayerStats(apiPlayer),
             isFiring:              apiPlayer.isFiring             || false,
             isOutsideBlueCircle:   apiPlayer.isOutsideBlueCircle || false,
-            inDamage:              nonNeg(apiPlayer.inDamage),
-            driveDistance:         nonNeg(apiPlayer.driveDistance),
-            marchDistance:         nonNeg(apiPlayer.marchDistance),
-            outsideBlueCircleTime: nonNeg(apiPlayer.outsideBlueCircleTime),
-            rescueTimes:           nonNeg(apiPlayer.rescueTimes),
-            gotAirDropNum:         nonNeg(apiPlayer.gotAirDropNum),
-            maxKillDistance:       nonNeg(apiPlayer.maxKillDistance),
-            killNumInVehicle:      nonNeg(apiPlayer.killNumInVehicle),
-            killNumByGrenade:      nonNeg(apiPlayer.killNumByGrenade),
-            AIKillNum:             nonNeg(apiPlayer.AIKillNum),
-            BossKillNum:           nonNeg(apiPlayer.BossKillNum),
-            useSmokeGrenadeNum:    nonNeg(apiPlayer.useSmokeGrenadeNum),
-            useFragGrenadeNum:     nonNeg(apiPlayer.useFragGrenadeNum),
-            useBurnGrenadeNum:     nonNeg(apiPlayer.useBurnGrenadeNum),
-            useFlashGrenadeNum:    nonNeg(apiPlayer.useFlashGrenadeNum),
-            PoisonTotalDamage:     nonNeg(apiPlayer.PoisonTotalDamage),
-            UseSelfRescueTime:     nonNeg(apiPlayer.UseSelfRescueTime),
-            UseEmergencyCallTime:  nonNeg(apiPlayer.UseEmergencyCallTime),
-            heal:                  nonNeg(apiPlayer.heal),
             teamId:                apiPlayer.teamId,
             teamName:              apiPlayer.teamName             || '',
             character:             apiPlayer.character            || 'None',
@@ -1029,13 +1041,10 @@ function startLiveMatchUpdater() {
             showPicUrl:    '',
             playerName:    apiPlayer.playerName,
             // `...apiPlayer` above spreads every raw field unguarded — same
-            // -1-sentinel leak as the branch above, so re-clamp the numeric
-            // stats explicitly rather than trusting the spread.
-            health:        nonNeg(apiPlayer.health),
-            liveState:     nonNeg(apiPlayer.liveState),
-            killNum:       nonNeg(apiPlayer.killNum),
-            damage:        nonNeg(apiPlayer.damage),
-            rank:          nonNeg(apiPlayer.rank),
+            // -1-sentinel leak as the branch above, so re-clamp the full
+            // numeric-stat field list the same way (shared helper keeps the
+            // two branches' field lists from drifting apart again).
+            ...clampedNumericPlayerStats(apiPlayer),
           };
         }
 

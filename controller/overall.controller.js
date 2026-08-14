@@ -41,10 +41,16 @@ const NUMERIC_PLAYER_FIELDS = [
   'contribution'
 ];
 
+// `|| 0` doesn't catch a negative number (e.g. PCOB's raw -1 "not populated
+// yet" sentinel on fields like rank) since it's truthy — same bug class
+// documented in pubgApiMatchData.controller.js's `nonNeg`. Guard explicitly
+// so a leaked negative never sums straight into the round-wide aggregate.
+const nonNeg = (v) => (typeof v === 'number' && v > 0) ? v : 0;
+
 function sumNumericFields(target, source, fields) {
   for (const f of fields) {
-    const a = Number(target[f] || 0);
-    const b = Number(source[f] || 0);
+    const a = nonNeg(Number(target[f]));
+    const b = nonNeg(Number(source[f]));
     target[f] = a + b;
   }
 }
