@@ -22,6 +22,15 @@ router.get(
   matchDataController.getMatchDataByMatchId
 );
 
+// Live players in this match with no roster match right now (picUrl/name
+// unresolved) — powers the "unmatched players" panel so operators can spot
+// and fix a bad roster UID during the match instead of it silently failing.
+router.get(
+  '/matchdata/:matchId/unmatched-players',
+  requireAuth,
+  matchDataController.getUnmatchedPlayersForMatch
+);
+
 // Update player: include teamId
 // PATCH /.../matchdata/:matchDataId/team/:teamId/player/:playerId
 

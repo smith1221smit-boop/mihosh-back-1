@@ -195,7 +195,7 @@ const sessionMiddleware = session({
   store: sessionStore,
   proxy: true, // Trust the reverse proxy (important for HTTPS)
   cookie: {
-    secure: true, // Only secure in true production, not local IP
+      secure: true, // Only secure in true production, not local IP
     httpOnly: true, // Prevent client-side JS from accessing the cookie
     sameSite: 'none', // 'none' only for true production
     maxAge: 7 * 24 * 60 * 60 * 1000, // 7 days

@@ -812,6 +812,28 @@ const removePlayersFromTeamInMatchData = async (req, res) => {
   }
 };
 
+// Surfaces which live players in this match currently have no roster match
+// (see markUnmatched/getUnmatchedPlayers in pubgApiMatchData.controller.js)
+// so an operator can fix a bad UID instead of it silently never working —
+// backs the panel in matchDataController.tsx.
+//
+// Required lazily, inside the handler, rather than at module load time:
+// pubgApiMatchData.controller.js requires Bulkpublic.controller.js, which in
+// turn requires createMatchDataForMatchDoc from THIS file — a top-level
+// require here would close that into a circular require and risk this file's
+// own exports being partially undefined wherever the cycle resolves first.
+// By request time every module has already finished loading, so this always
+// resolves to the fully-populated export.
+const getUnmatchedPlayersForMatch = async (req, res) => {
+  try {
+    const { matchId } = req.params;
+    const { getUnmatchedPlayers } = require('./Api_controllers/pubgApiMatchData.controller');
+    res.json(getUnmatchedPlayers(matchId));
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+};
+
 module.exports = {
   createMatchDataForMatchDoc,
   syncMatchDataTeamsForGroup,
@@ -823,5 +845,6 @@ module.exports = {
   updatePlayerByIdInMatchData,
   addPlayersToTeamInMatchData,
   removePlayersFromTeamInMatchData,
-  updateTeamPlayersBulkStats
+  updateTeamPlayersBulkStats,
+  getUnmatchedPlayersForMatch,
 };

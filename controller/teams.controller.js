@@ -72,6 +72,16 @@ function normalizePlayers(players) {
 // pubgApiMatchData.controller.js's uidToTeam matching resolves which team
 // a live tick's stats belong to deterministically (first team wins, with a
 // warning logged) rather than rejecting the data here.
+// A real PUBG UID is digits-only. Rejecting anything else here — instead of
+// silently saving it — catches the actual leading cause of a roster player
+// never matching a live tick: rosters are commonly prepared in a spreadsheet,
+// and Excel/Sheets silently renders a large pasted number in scientific
+// notation (e.g. 5584637887 -> "5.58464E+09"), which looks fine in the cell
+// but will never equal what pubgApiMatchData.controller.js compares against
+// apiPlayer.uId. A stray comma, space, or non-numeric ID pasted from the
+// wrong source field fails the same way.
+const PLAYER_ID_FORMAT = /^\d{5,20}$/;
+
 function validatePlayerIds(players) {
   const list = Array.isArray(players) ? players : [];
   const seen = new Map(); // playerId -> first index seen, to catch dupes within this same request
@@ -82,6 +92,9 @@ function validatePlayerIds(players) {
     const playerId = typeof p.playerId === 'string' ? p.playerId.trim() : '';
     if (!playerId) {
       return { ok: false, error: `Player "${p.playerName}" is missing a playerId (PUBG ID) — every roster player needs one so live stats can be matched correctly.` };
+    }
+    if (!PLAYER_ID_FORMAT.test(playerId)) {
+      return { ok: false, error: `Player "${p.playerName}"'s playerId "${playerId}" doesn't look like a real PUBG UID (digits only). This is the most common cause of a player's photo never showing up live — check for a copy-paste issue, e.g. Excel/Sheets turning a large number into scientific notation.` };
     }
     if (seen.has(playerId)) {
       return { ok: false, error: `playerId "${playerId}" is used by more than one player in this request.` };

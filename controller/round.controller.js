@@ -5,6 +5,7 @@ const Match = require('../models/match.model');
 const MatchSelection = require('../models/MatchSelection.model');
 const Tournament = require('../models/tournament.model');
 const { invalidateScope } = require('../middleware/cache.js');
+const { getSocket } = require('../socket');
 
 const ALLOWED_UPDATE_FIELDS = ['roundName', 'torLogo', 'day', 'groups', 'apiEnable', 'selectedMatch'];
 
@@ -75,8 +76,15 @@ const createRoundInTournament = async (req, res) => {
 
     res.status(201).json(savedRound);
 
-    // After responding: clear public cache. Doesn't block the client.
+    // After responding: clear public cache and notify this user's other
+    // open tabs/tournaments. apiEnable is enforced globally per user (see
+    // the updateMany above), so creating this round with apiEnable:true may
+    // have silently disabled a round in a DIFFERENT tournament — that
+    // tournament's cached rounds list (Round.tsx) only learns about it via
+    // this event, otherwise it shows the stale apiEnable:true state until
+    // its cache TTL happens to expire.
     invalidatePublicScope(tournamentId);
+    getSocket().to(`user:${createdBy}`).emit('roundUpdated', { round: savedRound });
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
@@ -189,7 +197,11 @@ const updateRound = async (req, res) => {
 
     res.json(updatedRound);
 
+    // Same cross-tournament staleness reasoning as createRoundInTournament
+    // above — this update's apiEnable:true may have just disabled a round
+    // in a different tournament via the updateMany above.
     invalidatePublicScope(tournamentId);
+    getSocket().to(`user:${userId}`).emit('roundUpdated', { round: updatedRound });
   } catch (err) {
     await session.abortTransaction();
     session.endSession();
@@ -216,6 +228,7 @@ const deleteRound = async (req, res) => {
     res.json({ message: 'Round deleted successfully' });
 
     invalidatePublicScope(tournamentId);
+    getSocket().to(`user:${userId}`).emit('roundUpdated', { roundId: id, deleted: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

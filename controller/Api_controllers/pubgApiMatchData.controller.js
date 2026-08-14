@@ -10,7 +10,7 @@ const updateTeamsWithApiPlayers = require('./playerCheckandSwitch');
 const { getSocket } = require('../../socket');
 const { computeOverallMatchDataForRound } = require('../overall.controller');
 const { encodeMsgpack } = require('../../utils/msgpackCodec');
-const { updateDeadTeamList } = require('../Bulkpublic.controller');
+const { updateDeadTeamList, hydrateMatchDataIdentity } = require('../Bulkpublic.controller');
 
 // ─── In-Memory Live Match Cache ───────────────────────────────────────────────
 const liveMatchCache = new Map();
@@ -77,6 +77,48 @@ async function getGroupsCached(tournamentId, userId) {
   const groups = await fetchGroups(tournamentId, userId);
   groupCache.set(key, { groups, expiresAt: Date.now() + GROUP_CACHE_TTL_MS });
   return groups;
+}
+
+// ─── Unmatched-Player Diagnostic Log ──────────────────────────────────────────
+// Surfaces exactly which live players fail to resolve against the roster —
+// the dominant real cause of a missing picUrl is a roster playerId that
+// doesn't actually match this player's live uId (see the format check added
+// to teams.controller.js's validatePlayerIds). Without this, that failure is
+// completely silent. Rate-limited per (match, uid) so a persistently
+// unmatched player doesn't spam the log every ~2s tick.
+const UNMATCHED_LOG_TTL_MS = 5 * 60 * 1000;
+const loggedUnmatched = new Map(); // `${matchId}:${uid}` -> lastLoggedAt
+
+function logUnmatchedPlayer(matchId, uid, playerName) {
+  const key = `${matchId}:${uid}`;
+  const lastLogged = loggedUnmatched.get(key);
+  if (lastLogged && Date.now() - lastLogged < UNMATCHED_LOG_TTL_MS) return;
+  loggedUnmatched.set(key, Date.now());
+  console.warn(
+    `[unmatched-player] match=${matchId} uId=${uid} playerName="${playerName}" — no roster match this tick, picUrl will stay blank until the roster playerId is fixed`
+  );
+}
+
+// Live, queryable view of who's currently unmatched per match (unlike the
+// rate-limited log above, this always reflects the latest tick) — backs the
+// operator-facing "unmatched players" panel in matchDataController.tsx.
+const unmatchedPlayersByMatch = new Map(); // matchId (string) -> Map<uid, { playerName, lastSeenAt }>
+
+function markUnmatched(matchId, uid, playerName) {
+  const key = String(matchId);
+  let m = unmatchedPlayersByMatch.get(key);
+  if (!m) { m = new Map(); unmatchedPlayersByMatch.set(key, m); }
+  m.set(uid, { playerName, lastSeenAt: Date.now() });
+}
+
+function markMatched(matchId, uid) {
+  unmatchedPlayersByMatch.get(String(matchId))?.delete(uid);
+}
+
+function getUnmatchedPlayers(matchId) {
+  const m = unmatchedPlayersByMatch.get(String(matchId));
+  if (!m) return [];
+  return Array.from(m.entries()).map(([uid, info]) => ({ uid, ...info }));
 }
 
 // ─── API-Enabled Round IDs Cache ──────────────────────────────────────────────
@@ -826,6 +868,15 @@ function startLiveMatchUpdater() {
 
     const normalizeId = id => (id ? String(id).trim() : '');
 
+    // Case-fold and strip whitespace/punctuation/symbols (Unicode-aware —
+    // covers ASCII brackets/dashes as well as common decorative clan-tag
+    // separators like full-width brackets or a katakana middle dot) before
+    // comparing names for the roster-rescue fallback below. Real
+    // letters/digits in any script are left alone, so two genuinely
+    // different names still won't collide — this only rescues names that
+    // differ purely in formatting.
+    const normalizeNameForMatch = name => String(name).toLowerCase().replace(/[\p{P}\p{S}\p{Z}]/gu, '');
+
     // Pre-index every group's slots by team _id once, instead of a linear
     // `slots.find(...)` scan per team below (was O(teams × slots)). Spans
     // ALL groups for this tournament+user (not just one) — a team's
@@ -900,10 +951,10 @@ function startLiveMatchUpdater() {
         // needing a manual re-entry, and is what lets the roster photo
         // (grpPlayer.photo, below) still get attached.
         if (!matchPlayer && !grpPlayer && apiPlayer.playerName) {
-          const apiNameNorm = String(apiPlayer.playerName).trim().toLowerCase();
+          const apiNameNorm = normalizeNameForMatch(apiPlayer.playerName);
           if (apiNameNorm) {
             grpPlayer = groupPlayers.find(
-              p => p.playerName && String(p.playerName).trim().toLowerCase() === apiNameNorm
+              p => p.playerName && normalizeNameForMatch(p.playerName) === apiNameNorm
             );
           }
         }
@@ -962,7 +1013,11 @@ function startLiveMatchUpdater() {
           const teamDbId = String(team.teamId);
           const list = resolvedPlayersByTeamId.get(teamDbId);
           if (list) list.push(apiPlayer); else resolvedPlayersByTeamId.set(teamDbId, [apiPlayer]);
+          markMatched(matchId, uid);
         } else {
+          logUnmatchedPlayer(matchId, uid, apiPlayer.playerName);
+          markUnmatched(matchId, uid, apiPlayer.playerName);
+
           finalPlayer = {
             ...apiPlayer,
             _id:           new mongoose.Types.ObjectId(),
@@ -1020,6 +1075,13 @@ function startLiveMatchUpdater() {
       // detected without assuming a fixed 4-player array.
       team.players = newTeamPlayers;
     }
+
+    // A player who fails to resolve against the roster this tick (the
+    // `else` branch above) gets picUrl/playerName wiped to '' with no
+    // retry within this function — this is the one place that can backfill
+    // it before the tick is persisted/emitted, using the same identity
+    // cache the public bulk endpoints already rely on for "result" screens.
+    hydrateMatchDataIdentity(matchData, tournamentId);
 
     updateTeamsWithApiPlayers(resolvedPlayersByTeamId, matchId, userId).catch(err =>
       console.error(`[updateTeamsWithApiPlayers] user ${userId} match ${matchId}:`, err.message)
@@ -1262,4 +1324,4 @@ function startLiveMatchUpdater() {
   setInterval(discoverAndStartPollingUsers, 10000);
 }
 
-module.exports = { startLiveMatchUpdater };
+module.exports = { startLiveMatchUpdater, getUnmatchedPlayers };

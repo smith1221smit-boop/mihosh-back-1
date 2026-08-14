@@ -187,9 +187,13 @@ function aggregateOverallTeams(matchDataDocs) {
       }
 
       const aggTeam = teamsMap.get(teamKey);
-      if (!aggTeam.teamName && team.teamName) aggTeam.teamName = team.teamName;
-      if (!aggTeam.teamTag && team.teamTag) aggTeam.teamTag = team.teamTag;
-      if (!aggTeam.teamLogo && team.teamLogo) aggTeam.teamLogo = team.teamLogo;
+      // Identity fields (name/tag/logo) reflect the LATEST match, not the
+      // first — a mid-round rebrand/logo change should propagate to the
+      // overall standings. Matches the player identity fields below, which
+      // already overwrite on every truthy value instead of only-if-empty.
+      if (team.teamName) aggTeam.teamName = team.teamName;
+      if (team.teamTag) aggTeam.teamTag = team.teamTag;
+      if (team.teamLogo) aggTeam.teamLogo = team.teamLogo;
 
       if (Number.isFinite(team.slot)) {
         aggTeam.slot = Math.min(aggTeam.slot || team.slot, team.slot);
@@ -325,7 +329,15 @@ const computeOverallMatchDataForRound = async (tournamentId, roundId, matchId, u
   // Load all matchData after attempting creation
   const matchDatas = await MatchData.find({ matchId: { $in: matchIds }, ...(userId && { userId }) }).lean();
 
-  return aggregateOverallTeams(matchDatas);
+  // MatchData.find({$in: matchIds}) does not guarantee results come back in
+  // matchIds order — but aggregateOverallTeams treats "last processed" as
+  // the source of truth for identity fields (teamName/teamTag/teamLogo/
+  // picUrl/etc.), so processing order must reflect real match order.
+  // matchIds is already matchNo-sorted (see getRoundMeta), so re-order by it.
+  const matchDataByMatchId = new Map(matchDatas.map(md => [md.matchId.toString(), md]));
+  const orderedMatchDatas = matchIds.map(id => matchDataByMatchId.get(id.toString())).filter(Boolean);
+
+  return aggregateOverallTeams(orderedMatchDatas);
 };
 
 // GET overall aggregated matchData for a round in a tournament

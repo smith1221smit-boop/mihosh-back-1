@@ -194,7 +194,13 @@ function applyLiveTeamDiff(matchId, matchData) {
 // (name/photo) silently bleed into a completely unrelated tournament that
 // happens to reuse the same shared team. Scoping by tournamentId keeps each
 // tournament's cached identity data isolated from every other one.
-const playerIdentityCache = new Map(); // `${tournamentId}:${playerId}` -> { playerName, picUrl, showPicUrl }
+// Keyed by the player's stable `uId`, NOT `player._id` — in the live
+// API-polling pipeline (pubgApiMatchData.controller.js), every player's
+// `_id` is a brand-new ObjectId generated fresh on EVERY tick, so an
+// `_id`-keyed cache could never hit for that pipeline (each tick looks like
+// a never-seen-before player). `uId` is the one identifier that's actually
+// stable tick-to-tick and match-to-match.
+const playerIdentityCache = new Map(); // `${tournamentId}:${uId}` -> { playerName, picUrl, showPicUrl }
 const teamIdentityCache = new Map();   // `${tournamentId}:${teamId}`   -> { teamName, teamTag, teamLogo }
 
 function hydrateMatchDataIdentity(matchData, tournamentId) {
@@ -223,25 +229,29 @@ function hydrateMatchDataIdentity(matchData, tournamentId) {
     }
 
     for (const player of team.players || []) {
-      const playerId = player._id?.toString();
-      if (!playerId) continue;
-      const pKey = `${scope}:${playerId}`;
+      // Prefer the stable `uId` (see comment on playerIdentityCache above);
+      // `_id` is only a fallback for the rare shape that has no uId at all.
+      const uid = (player.uId != null && String(player.uId).trim()) || player._id?.toString();
+      if (!uid) continue;
+      const pKey = `${scope}:${uid}`;
+      const cached = playerIdentityCache.get(pKey);
 
-      const isPlayerComplete = Boolean(player.playerName);
-      if (isPlayerComplete) {
-        playerIdentityCache.set(pKey, {
-          playerName: player.playerName,
-          picUrl: player.picUrl,
-          showPicUrl: player.showPicUrl,
-        });
-      } else {
-        const cached = playerIdentityCache.get(pKey);
-        if (cached) {
-          player.playerName = player.playerName || cached.playerName;
-          player.picUrl = player.picUrl || cached.picUrl;
-          player.showPicUrl = player.showPicUrl || cached.showPicUrl;
-        }
-      }
+      // Backfill per-field, not all-or-nothing — a player showing up with a
+      // real name but a blank picUrl (the common case: raw API telemetry
+      // always has a name, never a photo) must still get their photo
+      // backfilled, not be treated as "complete" just because the name is
+      // present.
+      if (!player.playerName && cached?.playerName) player.playerName = cached.playerName;
+      if (!player.picUrl && cached?.picUrl) player.picUrl = cached.picUrl;
+      if (!player.showPicUrl && cached?.showPicUrl) player.showPicUrl = cached.showPicUrl;
+
+      // Then record whatever the player now has — never regress a
+      // previously-known-good field back to blank.
+      playerIdentityCache.set(pKey, {
+        playerName: player.playerName || cached?.playerName || '',
+        picUrl: player.picUrl || cached?.picUrl || '',
+        showPicUrl: player.showPicUrl || cached?.showPicUrl || '',
+      });
     }
   }
 
@@ -431,7 +441,15 @@ async function getOverallForRound(tournamentId, roundId, { matches: matchesIn, m
   }
 
   const matchDataMap = matchDataMapIn || await getMatchDataBatch(matches);
-  const teams = aggregateOverallTeams(Array.from(matchDataMap.values()));
+  // Order by `matches` (already matchNo-sorted) rather than Map insertion
+  // order — aggregateOverallTeams' identity fields (teamName/teamTag/
+  // teamLogo/picUrl/etc.) take the LAST-processed match's value, so this
+  // must reflect real chronological match order. See overall.controller.js's
+  // computeOverallMatchDataForRound for the matching fix.
+  const orderedMatchDatas = matches
+    .map(m => matchDataMap.get(m._id.toString()))
+    .filter(Boolean);
+  const teams = aggregateOverallTeams(orderedMatchDatas);
 
   return {
     tournamentId,
