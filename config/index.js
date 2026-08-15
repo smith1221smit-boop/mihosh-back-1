@@ -30,9 +30,9 @@ const config = {
   SESSION_SECRET: envVars.SESSION_SECRET || 'supersecretkey123',
   
 // Database
-  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://demon:P6whwJ8qsMfIZg2F@cluster0.ix4q7ng.mongodb.net/?appName=Cluster0',
-  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://valid-flamingo-189638.upstash.io',
-  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAuTGAAIgcDFmOTYwYjk2NmE1MWU0MTFmYThiNmMxYWViZjAyNjZjMA',
+  MONGODB_URI: envVars.MONGODB_URI || 'mongodb+srv://rsns12446_db_user:QUoHZsI2d9mDKhxu@cluster0.w0x92fh.mongodb.net/?appName=Cluster0',
+  UPSTASH_REDIS_REST_URL: envVars.UPSTASH_REDIS_REST_URL || 'https://integral-ram-93391.upstash.io',
+  UPSTASH_REDIS_REST_TOKEN: envVars.UPSTASH_REDIS_REST_TOKEN || 'gQAAAAAAAWzPAAIgcDI0YjQwYTM1OWRmMTM0ZGJjYjZlYzIzNmI4YmNhZjk1Zg',
   
   // Logging
   LOG_LEVEL: envVars.LOG_LEVEL || 'info',
