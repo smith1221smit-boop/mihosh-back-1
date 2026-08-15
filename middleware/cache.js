@@ -173,8 +173,14 @@ cacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
 
     const originalJson = res.json;
     res.json = function (data) {
-      console.log('CACHE SAVE:', key);
-      setCache(key, data, ttlSeconds, scope).catch(console.warn);
+      // Only persist actual successes — res.status(4xx/5xx).json(...) still
+      // routes through this same patched res.json, and caching an error body
+      // here means every request for this key returns that cached error (with
+      // an implicit 200 on the cache-hit path above) until the TTL lapses.
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        console.log('CACHE SAVE:', key);
+        setCache(key, data, ttlSeconds, scope).catch(console.warn);
+      }
       originalJson.call(this, data);
     };
 
@@ -201,8 +207,11 @@ msgpackCacheMiddleware = (ttlSeconds = 300, scopeFn = null) => {
     }
 
     res.json = function (data) {
-      console.log('CACHE SAVE:', key);
-      setCache(key, data, ttlSeconds, scope).catch(console.warn);
+      // See cacheMiddleware above for why this only caches on success.
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        console.log('CACHE SAVE:', key);
+        setCache(key, data, ttlSeconds, scope).catch(console.warn);
+      }
       res.set('Content-Type', 'application/msgpack');
       res.send(encodeMsgpack(data));
     };
